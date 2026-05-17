@@ -1,4 +1,4 @@
-"""Local companion: manual upload, SubDL import, and Gemini translation."""
+"""Local companion: manual upload, provider import, and Gemini translation."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Upload
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import config
-from services import subdl_service
+from services import subdl_service, subsource_service
 from services.cache_db import insert_subtitle, list_subtitles
 from services.gemini_service import (
     GeminiError,
@@ -18,6 +18,7 @@ from services.gemini_service import (
     get_status as get_gemini_status,
 )
 from services.subdl_service import SubDLError, SubDLNotConfiguredError
+from services.subsource_service import SubSourceError, SubSourceNotConfiguredError
 from services.translation_service import (
     EnglishFileMissingError,
     RecordNotFoundError,
@@ -42,11 +43,12 @@ _COMPANION_HTML = """<!doctype html>
   <title>Arabic by M.S — Companion</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, sans-serif;
-           max-width: 980px; margin: 2rem auto; padding: 0 1rem; color: #1f2937; }
+           max-width: 1100px; margin: 2rem auto; padding: 0 1rem; color: #1f2937; }
     h1 { margin-bottom: 0.25rem; }
     h2 { margin-top: 0; }
     .sub { color: #6b7280; margin-top: 0; }
     .section { margin-top: 2rem; }
+    .provider-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1rem; }
     form { background: #f9fafb; padding: 1rem 1.25rem; border-radius: 8px;
            border: 1px solid #e5e7eb; }
     label { display: block; margin: 0.6rem 0 0.25rem; font-weight: 600; font-size: 0.9rem; }
@@ -78,43 +80,81 @@ _COMPANION_HTML = """<!doctype html>
 </head>
 <body>
   <h1>Arabic by M.S — Companion</h1>
-  <p class="sub">Upload an English <code>.srt</code> or import one from SubDL, then translate it to Arabic via Gemini.</p>
+  <p class="sub">Upload an English <code>.srt</code> or import one from SubDL or SubSource, then translate it to Arabic via Gemini.</p>
 
   <div id="gemini-status" class="status-panel msg">Checking Gemini configuration…</div>
   <div id="subdl-status" class="status-panel msg">Checking SubDL configuration…</div>
+  <div id="subsource-status" class="status-panel msg">Checking SubSource configuration…</div>
 
   <div class="section">
-    <h2>Search SubDL</h2>
-    <form id="subdl-form">
-      <label for="subdl_video_id">Video ID <span style="color:#dc2626">*</span> (IMDb preferred)</label>
-      <input id="subdl_video_id" name="video_id" required placeholder="tt1234567" />
+    <h2>Provider search</h2>
+    <div class="provider-grid">
+      <div>
+        <form id="subdl-form">
+          <h2>Search SubDL</h2>
+          <label for="subdl_video_id">Video ID <span style="color:#dc2626">*</span> (IMDb preferred)</label>
+          <input id="subdl_video_id" name="video_id" required placeholder="tt1234567" />
 
-      <label for="subdl_video_type">Video type</label>
-      <select id="subdl_video_type" name="video_type">
-        <option value="movie" selected>movie</option>
-        <option value="series">series</option>
-      </select>
+          <label for="subdl_video_type">Video type</label>
+          <select id="subdl_video_type" name="video_type">
+            <option value="movie" selected>movie</option>
+            <option value="series">series</option>
+          </select>
 
-      <label for="subdl_season">Season (optional)</label>
-      <input id="subdl_season" name="season" inputmode="numeric" placeholder="1" />
+          <label for="subdl_season">Season (optional)</label>
+          <input id="subdl_season" name="season" inputmode="numeric" placeholder="1" />
 
-      <label for="subdl_episode">Episode (optional)</label>
-      <input id="subdl_episode" name="episode" inputmode="numeric" placeholder="1" />
+          <label for="subdl_episode">Episode (optional)</label>
+          <input id="subdl_episode" name="episode" inputmode="numeric" placeholder="1" />
 
-      <label for="subdl_query">Query fallback (optional)</label>
-      <input id="subdl_query" name="query" placeholder="Series name or release string" />
+          <label for="subdl_query">Query fallback (optional)</label>
+          <input id="subdl_query" name="query" placeholder="Series name or release string" />
 
-      <label for="subdl_language">Language</label>
-      <input id="subdl_language" name="language" value="EN" />
+          <label for="subdl_language">Language</label>
+          <input id="subdl_language" name="language" value="EN" />
 
-      <label for="subdl_release_name">Preferred release name (optional)</label>
-      <input id="subdl_release_name" name="release_name" placeholder="Some.Show.S01E01.1080p.WEB-DL" />
+          <label for="subdl_release_name">Preferred release name (optional)</label>
+          <input id="subdl_release_name" name="release_name" placeholder="Some.Show.S01E01.1080p.WEB-DL" />
 
-      <button type="submit" class="primary">Search SubDL</button>
-    </form>
+          <button type="submit" class="primary">Search SubDL</button>
+        </form>
+        <div id="subdl-result"></div>
+        <div id="subdl-results" class="empty">No SubDL search run yet.</div>
+      </div>
 
-    <div id="subdl-result"></div>
-    <div id="subdl-results" class="empty">No SubDL search run yet.</div>
+      <div>
+        <form id="subsource-form">
+          <h2>Search SubSource</h2>
+          <label for="subsource_video_id">Video ID <span style="color:#dc2626">*</span> (IMDb preferred)</label>
+          <input id="subsource_video_id" name="video_id" required placeholder="tt1234567" />
+
+          <label for="subsource_video_type">Video type</label>
+          <select id="subsource_video_type" name="video_type">
+            <option value="movie" selected>movie</option>
+            <option value="series">series</option>
+          </select>
+
+          <label for="subsource_season">Season (optional)</label>
+          <input id="subsource_season" name="season" inputmode="numeric" placeholder="1" />
+
+          <label for="subsource_episode">Episode (optional)</label>
+          <input id="subsource_episode" name="episode" inputmode="numeric" placeholder="1" />
+
+          <label for="subsource_query">Query fallback (optional)</label>
+          <input id="subsource_query" name="query" placeholder="Series name or release string" />
+
+          <label for="subsource_language">Language</label>
+          <input id="subsource_language" name="language" value="en" />
+
+          <label for="subsource_release_name">Preferred release name (optional)</label>
+          <input id="subsource_release_name" name="release_name" placeholder="Some.Show.S01E01.1080p.WEB-DL" />
+
+          <button type="submit" class="primary">Search SubSource</button>
+        </form>
+        <div id="subsource-result"></div>
+        <div id="subsource-results" class="empty">No SubSource search run yet.</div>
+      </div>
+    </div>
   </div>
 
   <div class="section">
@@ -149,7 +189,9 @@ _COMPANION_HTML = """<!doctype html>
   <script>
     let geminiStatus = { configured: false, model: '', message: 'Checking Gemini configuration…' };
     let subdlStatus = __SUBDL_STATUS_JSON__;
+    let subsourceStatus = __SUBSOURCE_STATUS_JSON__;
     window._subdlItems = [];
+    window._subsourceItems = [];
 
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, c => ({
@@ -169,16 +211,25 @@ _COMPANION_HTML = """<!doctype html>
         escapeHtml(status.message);
     }
 
-    function renderSubdlStatus(status) {
-      subdlStatus = status;
-      const el = document.getElementById('subdl-status');
+    function renderProviderStatus(elementId, label, status, keyName) {
+      const el = document.getElementById(elementId);
       const klass = status.configured ? 'msg ok' : 'msg err';
       el.className = 'status-panel ' + klass;
       el.innerHTML =
-        '<strong>SubDL status:</strong> ' +
+        '<strong>' + escapeHtml(label) + ' status:</strong> ' +
         escapeHtml(status.configured ? 'Configured' : 'Not configured') +
         ' (<code>' + escapeHtml(status.base_url) + '</code>)<br />' +
-        escapeHtml(status.message);
+        escapeHtml(status.message || (keyName + ' is missing.'));
+    }
+
+    function renderSubdlStatus(status) {
+      subdlStatus = status;
+      renderProviderStatus('subdl-status', 'SubDL', status, 'SUBDL_API_KEY');
+    }
+
+    function renderSubsourceStatus(status) {
+      subsourceStatus = status;
+      renderProviderStatus('subsource-status', 'SubSource', status, 'SUBSOURCE_API_KEY');
     }
 
     async function refreshGeminiStatus() {
@@ -191,6 +242,20 @@ _COMPANION_HTML = """<!doctype html>
           configured: false,
           model: 'unknown',
           message: 'Failed to load Gemini status: ' + err.message
+        });
+      }
+    }
+
+    async function refreshSubsourceStatus() {
+      try {
+        const res = await fetch('/companion/subsource-status');
+        const data = await res.json();
+        renderSubsourceStatus(data);
+      } catch (err) {
+        renderSubsourceStatus({
+          configured: false,
+          base_url: 'unknown',
+          message: 'Failed to load SubSource status: ' + err.message
         });
       }
     }
@@ -222,25 +287,25 @@ _COMPANION_HTML = """<!doctype html>
     }
     window._translateRecord = translateRecord;
 
-    async function importSubdlResult(index, btn) {
-      const box = document.getElementById('subdl-result');
-      if (!subdlStatus.configured) {
-        box.innerHTML = '<div class="msg err">' + escapeHtml(subdlStatus.message) + '</div>';
+    async function importProviderResult(itemsName, index, status, resultElementId, endpoint, videoIdInputId, videoTypeInputId, releaseNameInputId, btn) {
+      const box = document.getElementById(resultElementId);
+      if (!status.configured) {
+        box.innerHTML = '<div class="msg err">' + escapeHtml(status.message) + '</div>';
         return;
       }
 
-      const item = window._subdlItems[index];
+      const item = window[itemsName][index];
       btn.disabled = true;
       const original = btn.textContent;
       btn.textContent = 'Importing…';
       try {
-        const res = await fetch('/companion/import-subdl', {
+        const res = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            video_id: document.getElementById('subdl_video_id').value,
-            video_type: document.getElementById('subdl_video_type').value,
-            release_name: item.release_name || document.getElementById('subdl_release_name').value || null,
+            video_id: document.getElementById(videoIdInputId).value,
+            video_type: document.getElementById(videoTypeInputId).value,
+            release_name: item.release_name || document.getElementById(releaseNameInputId).value || null,
             download_url: item.download_url
           })
         });
@@ -258,13 +323,42 @@ _COMPANION_HTML = """<!doctype html>
         btn.textContent = original;
       }
     }
+
+    async function importSubdlResult(index, btn) {
+      return importProviderResult(
+        '_subdlItems',
+        index,
+        subdlStatus,
+        'subdl-result',
+        '/companion/import-subdl',
+        'subdl_video_id',
+        'subdl_video_type',
+        'subdl_release_name',
+        btn
+      );
+    }
     window._importSubdlResult = importSubdlResult;
 
-    function renderSubdlResults(items) {
-      const node = document.getElementById('subdl-results');
+    async function importSubsourceResult(index, btn) {
+      return importProviderResult(
+        '_subsourceItems',
+        index,
+        subsourceStatus,
+        'subsource-result',
+        '/companion/import-subsource',
+        'subsource_video_id',
+        'subsource_video_type',
+        'subsource_release_name',
+        btn
+      );
+    }
+    window._importSubsourceResult = importSubsourceResult;
+
+    function renderProviderResults(nodeId, items, importFnName, emptyText) {
+      const node = document.getElementById(nodeId);
       if (!items || items.length === 0) {
         node.className = 'empty';
-        node.textContent = 'No SubDL results found.';
+        node.textContent = emptyText;
         return;
       }
       node.className = '';
@@ -280,7 +374,7 @@ _COMPANION_HTML = """<!doctype html>
             <td>${escapeHtml(item.language || '')}</td>
             <td>${escapeHtml(item.release_name || '')}</td>
             <td>${escapeHtml(String(item.score || 0))}</td>
-            <td><button onclick="_importSubdlResult(${index}, this)">Import</button></td>
+            <td><button onclick="${importFnName}(${index}, this)">Import</button></td>
           </tr>`).join('')}
         </tbody>
       </table>`;
@@ -331,36 +425,61 @@ _COMPANION_HTML = """<!doctype html>
       }
     }
 
-    document.getElementById('subdl-form').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const result = document.getElementById('subdl-result');
+    async function searchProvider(formId, status, resultId, resultsId, itemsName, endpoint, emptyText) {
+      const result = document.getElementById(resultId);
       result.innerHTML = '';
-      if (!subdlStatus.configured) {
-        result.innerHTML = '<div class="msg err">' + escapeHtml(subdlStatus.message) + '</div>';
+      if (!status.configured) {
+        result.innerHTML = '<div class="msg err">' + escapeHtml(status.message) + '</div>';
         return;
       }
 
       const params = new URLSearchParams();
-      for (const [key, value] of new FormData(e.target).entries()) {
+      for (const [key, value] of new FormData(document.getElementById(formId)).entries()) {
         if (String(value).trim()) {
           params.set(key, String(value).trim());
         }
       }
 
       try {
-        const res = await fetch('/companion/search-subdl?' + params.toString());
+        const res = await fetch(endpoint + '?' + params.toString());
         const data = await res.json();
         if (!res.ok) {
-          result.innerHTML = '<div class="msg err">' + escapeHtml(data.detail || 'SubDL search failed') + '</div>';
-          renderSubdlResults([]);
+          result.innerHTML = '<div class="msg err">' + escapeHtml(data.detail || 'Provider search failed') + '</div>';
+          renderProviderResults(resultsId, [], '_noop', emptyText);
           return;
         }
-        window._subdlItems = data.items || [];
-        renderSubdlResults(window._subdlItems);
-        result.innerHTML = '<div class="msg ok">Found ' + escapeHtml(String(window._subdlItems.length)) + ' SubDL result(s).</div>';
+        window[itemsName] = data.items || [];
+        renderProviderResults(resultsId, window[itemsName], itemsName === '_subdlItems' ? '_importSubdlResult' : '_importSubsourceResult', emptyText);
+        result.innerHTML = '<div class="msg ok">Found ' + escapeHtml(String(window[itemsName].length)) + ' result(s).</div>';
       } catch (err) {
         result.innerHTML = '<div class="msg err">' + escapeHtml(err.message) + '</div>';
       }
+    }
+
+    document.getElementById('subdl-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      await searchProvider(
+        'subdl-form',
+        subdlStatus,
+        'subdl-result',
+        'subdl-results',
+        '_subdlItems',
+        '/companion/search-subdl',
+        'No SubDL results found.'
+      );
+    });
+
+    document.getElementById('subsource-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      await searchProvider(
+        'subsource-form',
+        subsourceStatus,
+        'subsource-result',
+        'subsource-results',
+        '_subsourceItems',
+        '/companion/search-subsource',
+        'No SubSource results found.'
+      );
     });
 
     document.getElementById('upload-form').addEventListener('submit', async (e) => {
@@ -385,6 +504,8 @@ _COMPANION_HTML = """<!doctype html>
 
     refreshGeminiStatus();
     renderSubdlStatus(subdlStatus);
+    renderSubsourceStatus(subsourceStatus);
+    refreshSubsourceStatus();
     refreshList();
   </script>
 </body>
@@ -398,6 +519,9 @@ def companion_page() -> HTMLResponse:
     html = _COMPANION_HTML.replace(
         "__SUBDL_STATUS_JSON__",
         json.dumps(subdl_service.get_status()),
+    ).replace(
+        "__SUBSOURCE_STATUS_JSON__",
+        json.dumps(subsource_service.get_status()),
     )
     return HTMLResponse(html)
 
@@ -454,6 +578,29 @@ def _store_english_srt_record(
     }
 
 
+def _parse_import_payload(payload: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Normalize provider import payload fields."""
+    return {
+        "video_id": str(payload.get("video_id") or "").strip(),
+        "video_type": str(payload.get("video_type") or "movie").strip() or "movie",
+        "release_name": (
+            str(payload.get("release_name")).strip()
+            if payload.get("release_name") not in (None, "")
+            else None
+        ),
+        "download_url": str(payload.get("download_url") or "").strip(),
+    }
+
+
+async def _read_request_payload(request: Request) -> Dict[str, Any]:
+    """Accept either JSON or form-encoded provider import bodies."""
+    content_type = request.headers.get("content-type", "").lower()
+    if "application/json" in content_type:
+        return await request.json()
+    form = await request.form()
+    return dict(form)
+
+
 @router.post("/companion/upload-srt")
 async def upload_srt(
     video_id: str = Form(..., description="e.g. tt1234567"),
@@ -499,6 +646,12 @@ def gemini_status() -> Dict[str, Any]:
     return get_gemini_status()
 
 
+@router.get("/companion/subsource-status")
+def subsource_status() -> Dict[str, Any]:
+    """Return whether SubSource search/import is currently configured."""
+    return subsource_service.get_status()
+
+
 @router.get("/companion/search-subdl")
 def search_subdl(
     video_id: str,
@@ -527,28 +680,45 @@ def search_subdl(
     return {"items": items}
 
 
+@router.get("/companion/search-subsource")
+def search_subsource(
+    video_id: str,
+    video_type: str = "movie",
+    season: Optional[int] = Query(None),
+    episode: Optional[int] = Query(None),
+    query: Optional[str] = Query(None),
+    language: str = Query("en"),
+    release_name: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    """Search SubSource and return normalized subtitle candidates."""
+    try:
+        items = subsource_service.search_subtitles(
+            video_id=video_id,
+            video_type=video_type,
+            season=season,
+            episode=episode,
+            query=query,
+            language=language,
+            release_name=release_name,
+        )
+    except SubSourceNotConfiguredError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SubSourceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"items": items}
+
+
 @router.post("/companion/import-subdl")
 async def import_subdl(request: Request) -> JSONResponse:
     """Download an English SRT from SubDL, validate it, and add a DB record."""
-    content_type = request.headers.get("content-type", "").lower()
-    if "application/json" in content_type:
-        payload = await request.json()
-    else:
-        form = await request.form()
-        payload = dict(form)
-
-    video_id = str(payload.get("video_id") or "").strip()
-    video_type = str(payload.get("video_type") or "movie").strip() or "movie"
-    release_name = payload.get("release_name")
-    download_url = str(payload.get("download_url") or "").strip()
-
-    if not video_id:
+    payload = _parse_import_payload(await _read_request_payload(request))
+    if not payload["video_id"]:
         raise HTTPException(status_code=400, detail="video_id is required")
-    if not download_url:
+    if not payload["download_url"]:
         raise HTTPException(status_code=400, detail="download_url is required")
 
     try:
-        raw = subdl_service.download_subtitle_data(download_url)
+        raw = subdl_service.download_subtitle_data(str(payload["download_url"]))
         text = validate_srt_content(raw)
     except SubDLNotConfiguredError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -557,14 +727,40 @@ async def import_subdl(request: Request) -> JSONResponse:
     except SubDLError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    normalized_release_name = (
-        str(release_name).strip() if release_name not in (None, "") else None
-    )
     return JSONResponse(
         _store_english_srt_record(
-            video_id=video_id,
-            video_type=video_type,
-            release_name=normalized_release_name,
+            video_id=str(payload["video_id"]),
+            video_type=str(payload["video_type"]),
+            release_name=payload["release_name"],
+            text=text,
+        )
+    )
+
+
+@router.post("/companion/import-subsource")
+async def import_subsource(request: Request) -> JSONResponse:
+    """Download an English SRT from SubSource, validate it, and add a DB record."""
+    payload = _parse_import_payload(await _read_request_payload(request))
+    if not payload["video_id"]:
+        raise HTTPException(status_code=400, detail="video_id is required")
+    if not payload["download_url"]:
+        raise HTTPException(status_code=400, detail="download_url is required")
+
+    try:
+        raw = subsource_service.download_subtitle_data(str(payload["download_url"]))
+        text = validate_srt_content(raw)
+    except SubSourceNotConfiguredError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SRTValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SubSourceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return JSONResponse(
+        _store_english_srt_record(
+            video_id=str(payload["video_id"]),
+            video_type=str(payload["video_type"]),
+            release_name=payload["release_name"],
             text=text,
         )
     )

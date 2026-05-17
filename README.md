@@ -11,8 +11,15 @@ A FastAPI Stremio subtitle addon that serves Arabic subtitles.
   which feeds the cached English SRT to Gemini, saves the Arabic file under
   `cache/arabic/`, and updates the DB record so `/subtitles/...` starts
   serving the translated file.
+* **Phase 5** — SubDL search/import foundation. The companion page can search
+  SubDL, import an English subtitle result into the shared upload cache, and
+  then send that imported record through the same Gemini translation flow.
+* **Phase 6** — SubSource search/import. The companion page now supports both
+  SubDL and SubSource as external English subtitle providers, while keeping
+  manual upload, Gemini translation, and cache-first subtitle serving intact.
 
-Nvidia, SubDL, SubSource, and OpenSubtitles are **not** wired up yet.
+Nvidia and OpenSubtitles are **not** wired up yet.
+SubDL and SubSource are the currently supported external search/import providers.
 
 ## Project layout
 
@@ -30,13 +37,16 @@ Arabic_by_MS/
 │   ├── __init__.py
 │   ├── cache_db.py            # SQLite metadata
 │   ├── gemini_service.py      # Gemini REST client (env-driven)
+│   ├── subdl_service.py       # SubDL search/import provider
+│   ├── subsource_service.py   # SubSource search/import provider
 │   └── translation_service.py # Orchestrates translate pipeline
 ├── utils/
 │   ├── __init__.py
 │   ├── srt_validator.py       # Filename + content validation
 │   ├── hash_utils.py          # SHA-256 helpers
 │   ├── srt_chunker.py         # Parse / render / chunk SRT
-│   └── srt_cleaner.py         # Parse Gemini's numbered replies
+│   ├── srt_cleaner.py         # Parse Gemini's numbered replies
+│   └── subtitle_matcher.py    # Provider result scoring / ranking
 ├── cache/
 │   ├── arabic/sample_arabic.srt
 │   ├── english/               # User uploads land here
@@ -47,7 +57,9 @@ Arabic_by_MS/
 │   ├── test_srt_validator.py  # Phase 2 validator
 │   ├── test_cache_db.py       # Phase 2 SQLite layer
 │   ├── test_upload.py         # Phase 2 upload + cache fallback
-│   └── test_translation.py    # Phase 3 mocked Gemini translation
+│   ├── test_translation.py    # Phase 3 mocked Gemini translation
+│   ├── test_subdl.py          # Phase 5 mocked SubDL search/import
+│   └── test_subsource.py      # Phase 6 mocked SubSource search/import
 ├── requirements.txt
 ├── run.bat
 ├── .env.example
@@ -87,6 +99,11 @@ uvicorn backend.main:app --reload --port 8787
 | `GET /companion`                              | HTML page: upload + list + translate          |
 | `POST /companion/upload-srt`                  | Upload an English `.srt`                      |
 | `GET /companion/list`                         | JSON list of every uploaded record            |
+| `GET /companion/search-subdl`                 | Search SubDL for English subtitles            |
+| `POST /companion/import-subdl`                | Import a SubDL subtitle into the local cache  |
+| `GET /companion/subsource-status`             | SubSource configuration status                |
+| `GET /companion/search-subsource`             | Search SubSource for English subtitles        |
+| `POST /companion/import-subsource`            | Import a SubSource subtitle into local cache  |
 | `POST /companion/translate/{record_id}`       | Translate that record's English SRT to Arabic |
 
 ## Installing the addon in Stremio
@@ -100,7 +117,7 @@ uvicorn backend.main:app --reload --port 8787
 > If Stremio runs on another device, replace `127.0.0.1` with your LAN IP
 > (or a tunnel URL) and set `PUBLIC_BASE_URL` in `.env` accordingly.
 
-## Configuring Gemini (Phase 3)
+## Configuring Gemini (Phase 6)
 
 1. Copy `.env.example` to `.env`.
 2. Set `GEMINI_API_KEY=...` to a key from <https://aistudio.google.com/app/apikey>.
@@ -111,7 +128,19 @@ uvicorn backend.main:app --reload --port 8787
 
 If `GEMINI_API_KEY` is missing the translate endpoint returns **400** with
 a clear `"GEMINI_API_KEY is not set"` message; malformed Gemini output
-returns **502**. The DB is *not* updated on failure.
+returns **502**. Translation failures are stored as `status="failed"` with
+an `error_message`, and the companion page exposes a retry button.
+
+## Configuring SubDL and SubSource
+
+1. Copy `.env.example` to `.env`.
+2. Set `SUBDL_API_KEY=...` to use `GET /companion/search-subdl` and
+   `POST /companion/import-subdl`.
+3. Set `SUBSOURCE_API_KEY=...` to use `GET /companion/search-subsource` and
+   `POST /companion/import-subsource`.
+4. Leave `SUBDL_BASE_URL` and `SUBSOURCE_BASE_URL` at their defaults unless
+   you need to point at a different API environment.
+5. Restart the server and open `/companion`.
 
 ## Running the tests
 
@@ -120,4 +149,5 @@ pip install -r requirements.txt
 pytest
 ```
 
-All Gemini calls in tests are mocked — no live API traffic is made.
+All Gemini, SubDL, and SubSource calls in tests are mocked — no live API
+traffic is made.

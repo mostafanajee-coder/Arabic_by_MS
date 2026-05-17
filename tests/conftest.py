@@ -32,4 +32,6 @@ def isolated_storage(tmp_path, monkeypatch):
     monkeypatch.delenv("GEMINI_MODEL", raising=False)
     monkeypatch.delenv("SUBDL_API_KEY", raising=False)
     monkeypatch.delenv("SUBDL_BASE_URL", raising=False)
+    monkeypatch.delenv("SUBSOURCE_API_KEY", raising=False)
+    monkeypatch.delenv("SUBSOURCE_BASE_URL", raising=False)
     yield

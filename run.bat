@@ -1,11 +1,11 @@
 @echo off
 REM ---------------------------------------------------------------
-REM  Arabic by M.S - Stremio subtitle addon (Phase 4)
+REM  Arabic by M.S - Stremio subtitle addon (Phase 5)
 REM  Starts the FastAPI server with uvicorn on port 8787.
 REM ---------------------------------------------------------------
 
 setlocal
-title Arabic by M.S - Phase 4
+title Arabic by M.S - Phase 5
 
 REM Move to the directory this script lives in so relative paths work.
 cd /d "%~dp0"

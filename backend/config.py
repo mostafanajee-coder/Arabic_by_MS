@@ -5,8 +5,10 @@ Phase 2: adds cache/english/ and the SQLite metadata DB.
 Phase 3: adds Gemini env-var settings (read at call time in
 services/gemini_service.py — kept out of this module so tests can
 monkeypatch them with monkeypatch.setenv).
+Phase 5: adds SubDL env-var settings (read at call time in
+services/subdl_service.py).
 
-External providers other than Gemini (Nvidia, SubDL, SubSource,
+External providers other than Gemini and SubDL (Nvidia, SubSource,
 OpenSubtitles) are intentionally NOT wired up yet.
 """
 
@@ -54,10 +56,10 @@ DB_PATH: Path = CACHE_DIR / "subtitles.db"
 
 ADDON_ID: str = os.getenv("ADDON_ID", "community.arabic.by.ms")
 ADDON_NAME: str = os.getenv("ADDON_NAME", "Arabic by M.S")
-ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.3.0")
+ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.5.0")
 ADDON_DESCRIPTION: str = os.getenv(
     "ADDON_DESCRIPTION",
-    "Arabic subtitles for Stremio. Phase 3 adds Gemini translation.",
+    "Arabic subtitles for Stremio. Phase 5 adds SubDL search and Gemini translation.",
 )
 
 # ---------------------------------------------------------------------------

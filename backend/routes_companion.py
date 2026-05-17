@@ -1,21 +1,23 @@
-"""Local companion: HTML upload page + JSON upload/list/translate endpoints.
-
-Phase 2 added upload + list. Phase 3 adds POST /companion/translate/{record_id}
-which feeds the cached English SRT to Gemini and writes an Arabic SRT to
-cache/arabic/.
-"""
+"""Local companion: manual upload, SubDL import, and Gemini translation."""
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import config
+from services import subdl_service
 from services.cache_db import insert_subtitle, list_subtitles
-from services.gemini_service import GeminiError, GeminiNotConfiguredError, get_status
+from services.gemini_service import (
+    GeminiError,
+    GeminiNotConfiguredError,
+    get_status as get_gemini_status,
+)
+from services.subdl_service import SubDLError, SubDLNotConfiguredError
 from services.translation_service import (
     EnglishFileMissingError,
     RecordNotFoundError,
@@ -33,10 +35,6 @@ from utils.srt_validator import (
 router = APIRouter()
 
 
-# ---------------------------------------------------------------------------
-# HTML companion page
-# ---------------------------------------------------------------------------
-
 _COMPANION_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -44,9 +42,11 @@ _COMPANION_HTML = """<!doctype html>
   <title>Arabic by M.S — Companion</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, sans-serif;
-           max-width: 820px; margin: 2rem auto; padding: 0 1rem; color: #1f2937; }
+           max-width: 980px; margin: 2rem auto; padding: 0 1rem; color: #1f2937; }
     h1 { margin-bottom: 0.25rem; }
+    h2 { margin-top: 0; }
     .sub { color: #6b7280; margin-top: 0; }
+    .section { margin-top: 2rem; }
     form { background: #f9fafb; padding: 1rem 1.25rem; border-radius: 8px;
            border: 1px solid #e5e7eb; }
     label { display: block; margin: 0.6rem 0 0.25rem; font-weight: 600; font-size: 0.9rem; }
@@ -78,36 +78,78 @@ _COMPANION_HTML = """<!doctype html>
 </head>
 <body>
   <h1>Arabic by M.S — Companion</h1>
-  <p class="sub">Upload an English <code>.srt</code>, then translate it to Arabic via Gemini.</p>
+  <p class="sub">Upload an English <code>.srt</code> or import one from SubDL, then translate it to Arabic via Gemini.</p>
 
   <div id="gemini-status" class="status-panel msg">Checking Gemini configuration…</div>
+  <div id="subdl-status" class="status-panel msg">Checking SubDL configuration…</div>
 
-  <form id="form" enctype="multipart/form-data">
-    <label for="video_id">Video ID <span style="color:#dc2626">*</span> (e.g. <code>tt1234567</code>)</label>
-    <input id="video_id" name="video_id" required placeholder="tt1234567" />
+  <div class="section">
+    <h2>Search SubDL</h2>
+    <form id="subdl-form">
+      <label for="subdl_video_id">Video ID <span style="color:#dc2626">*</span> (IMDb preferred)</label>
+      <input id="subdl_video_id" name="video_id" required placeholder="tt1234567" />
 
-    <label for="video_type">Video type</label>
-    <select id="video_type" name="video_type">
-      <option value="movie" selected>movie</option>
-      <option value="series">series</option>
-    </select>
+      <label for="subdl_video_type">Video type</label>
+      <select id="subdl_video_type" name="video_type">
+        <option value="movie" selected>movie</option>
+        <option value="series">series</option>
+      </select>
 
-    <label for="release_name">Release name (optional)</label>
-    <input id="release_name" name="release_name" placeholder="Some.Movie.2024.1080p.WEB-DL" />
+      <label for="subdl_season">Season (optional)</label>
+      <input id="subdl_season" name="season" inputmode="numeric" placeholder="1" />
 
-    <label for="srt_file">English .srt file <span style="color:#dc2626">*</span></label>
-    <input id="srt_file" name="srt_file" type="file" accept=".srt" required />
+      <label for="subdl_episode">Episode (optional)</label>
+      <input id="subdl_episode" name="episode" inputmode="numeric" placeholder="1" />
 
-    <button type="submit" class="primary">Upload</button>
-  </form>
+      <label for="subdl_query">Query fallback (optional)</label>
+      <input id="subdl_query" name="query" placeholder="Series name or release string" />
+
+      <label for="subdl_language">Language</label>
+      <input id="subdl_language" name="language" value="EN" />
+
+      <label for="subdl_release_name">Preferred release name (optional)</label>
+      <input id="subdl_release_name" name="release_name" placeholder="Some.Show.S01E01.1080p.WEB-DL" />
+
+      <button type="submit" class="primary">Search SubDL</button>
+    </form>
+
+    <div id="subdl-result"></div>
+    <div id="subdl-results" class="empty">No SubDL search run yet.</div>
+  </div>
+
+  <div class="section">
+    <h2>Manual upload</h2>
+    <form id="upload-form" enctype="multipart/form-data">
+      <label for="video_id">Video ID <span style="color:#dc2626">*</span> (e.g. <code>tt1234567</code>)</label>
+      <input id="video_id" name="video_id" required placeholder="tt1234567" />
+
+      <label for="video_type">Video type</label>
+      <select id="video_type" name="video_type">
+        <option value="movie" selected>movie</option>
+        <option value="series">series</option>
+      </select>
+
+      <label for="release_name">Release name (optional)</label>
+      <input id="release_name" name="release_name" placeholder="Some.Movie.2024.1080p.WEB-DL" />
+
+      <label for="srt_file">English .srt file <span style="color:#dc2626">*</span></label>
+      <input id="srt_file" name="srt_file" type="file" accept=".srt" required />
+
+      <button type="submit" class="primary">Upload</button>
+    </form>
+  </div>
 
   <div id="result"></div>
 
-  <h2>Uploaded subtitles</h2>
-  <div id="list" class="empty">Loading…</div>
+  <div class="section">
+    <h2>Uploaded subtitles</h2>
+    <div id="list" class="empty">Loading…</div>
+  </div>
 
   <script>
     let geminiStatus = { configured: false, model: '', message: 'Checking Gemini configuration…' };
+    let subdlStatus = __SUBDL_STATUS_JSON__;
+    window._subdlItems = [];
 
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, c => ({
@@ -124,6 +166,18 @@ _COMPANION_HTML = """<!doctype html>
         '<strong>Gemini status:</strong> ' +
         escapeHtml(status.configured ? 'Configured' : 'Not configured') +
         ' (<code>' + escapeHtml(status.model) + '</code>)<br />' +
+        escapeHtml(status.message);
+    }
+
+    function renderSubdlStatus(status) {
+      subdlStatus = status;
+      const el = document.getElementById('subdl-status');
+      const klass = status.configured ? 'msg ok' : 'msg err';
+      el.className = 'status-panel ' + klass;
+      el.innerHTML =
+        '<strong>SubDL status:</strong> ' +
+        escapeHtml(status.configured ? 'Configured' : 'Not configured') +
+        ' (<code>' + escapeHtml(status.base_url) + '</code>)<br />' +
         escapeHtml(status.message);
     }
 
@@ -167,6 +221,70 @@ _COMPANION_HTML = """<!doctype html>
       }
     }
     window._translateRecord = translateRecord;
+
+    async function importSubdlResult(index, btn) {
+      const box = document.getElementById('subdl-result');
+      if (!subdlStatus.configured) {
+        box.innerHTML = '<div class="msg err">' + escapeHtml(subdlStatus.message) + '</div>';
+        return;
+      }
+
+      const item = window._subdlItems[index];
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = 'Importing…';
+      try {
+        const res = await fetch('/companion/import-subdl', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            video_id: document.getElementById('subdl_video_id').value,
+            video_type: document.getElementById('subdl_video_type').value,
+            release_name: item.release_name || document.getElementById('subdl_release_name').value || null,
+            download_url: item.download_url
+          })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          box.innerHTML = '<div class="msg err">' + escapeHtml(data.detail || 'Import failed') + '</div>';
+        } else {
+          box.innerHTML = '<div class="msg ok">Imported as record #' + escapeHtml(data.id) + '.</div>';
+          await refreshList();
+        }
+      } catch (err) {
+        box.innerHTML = '<div class="msg err">' + escapeHtml(err.message) + '</div>';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+    window._importSubdlResult = importSubdlResult;
+
+    function renderSubdlResults(items) {
+      const node = document.getElementById('subdl-results');
+      if (!items || items.length === 0) {
+        node.className = 'empty';
+        node.textContent = 'No SubDL results found.';
+        return;
+      }
+      node.className = '';
+      node.innerHTML = `<table>
+        <thead><tr>
+          <th>Provider</th><th>Subtitle ID</th><th>Language</th><th>Release</th>
+          <th>Score</th><th>Action</th>
+        </tr></thead>
+        <tbody>${items.map((item, index) => `
+          <tr>
+            <td>${escapeHtml(item.provider)}</td>
+            <td>${escapeHtml(item.subtitle_id || '')}</td>
+            <td>${escapeHtml(item.language || '')}</td>
+            <td>${escapeHtml(item.release_name || '')}</td>
+            <td>${escapeHtml(String(item.score || 0))}</td>
+            <td><button onclick="_importSubdlResult(${index}, this)">Import</button></td>
+          </tr>`).join('')}
+        </tbody>
+      </table>`;
+    }
 
     async function refreshList() {
       try {
@@ -213,7 +331,39 @@ _COMPANION_HTML = """<!doctype html>
       }
     }
 
-    document.getElementById('form').addEventListener('submit', async (e) => {
+    document.getElementById('subdl-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const result = document.getElementById('subdl-result');
+      result.innerHTML = '';
+      if (!subdlStatus.configured) {
+        result.innerHTML = '<div class="msg err">' + escapeHtml(subdlStatus.message) + '</div>';
+        return;
+      }
+
+      const params = new URLSearchParams();
+      for (const [key, value] of new FormData(e.target).entries()) {
+        if (String(value).trim()) {
+          params.set(key, String(value).trim());
+        }
+      }
+
+      try {
+        const res = await fetch('/companion/search-subdl?' + params.toString());
+        const data = await res.json();
+        if (!res.ok) {
+          result.innerHTML = '<div class="msg err">' + escapeHtml(data.detail || 'SubDL search failed') + '</div>';
+          renderSubdlResults([]);
+          return;
+        }
+        window._subdlItems = data.items || [];
+        renderSubdlResults(window._subdlItems);
+        result.innerHTML = '<div class="msg ok">Found ' + escapeHtml(String(window._subdlItems.length)) + ' SubDL result(s).</div>';
+      } catch (err) {
+        result.innerHTML = '<div class="msg err">' + escapeHtml(err.message) + '</div>';
+      }
+    });
+
+    document.getElementById('upload-form').addEventListener('submit', async (e) => {
       e.preventDefault();
       const formData = new FormData(e.target);
       const result = document.getElementById('result');
@@ -222,18 +372,19 @@ _COMPANION_HTML = """<!doctype html>
         const res = await fetch('/companion/upload-srt', { method: 'POST', body: formData });
         const data = await res.json();
         if (!res.ok) {
-          result.innerHTML = `<div class="msg err">${escapeHtml(data.detail || 'Upload failed')}</div>`;
+          result.innerHTML = '<div class="msg err">' + escapeHtml(data.detail || 'Upload failed') + '</div>';
         } else {
-          result.innerHTML = `<div class="msg ok">Uploaded as record #${data.id} (status: ${data.status}).</div>`;
+          result.innerHTML = '<div class="msg ok">Uploaded as record #' + escapeHtml(data.id) + ' (status: ' + escapeHtml(data.status) + ').</div>';
           e.target.reset();
           await refreshList();
         }
       } catch (err) {
-        result.innerHTML = `<div class="msg err">${escapeHtml(err.message)}</div>`;
+        result.innerHTML = '<div class="msg err">' + escapeHtml(err.message) + '</div>';
       }
     });
 
     refreshGeminiStatus();
+    renderSubdlStatus(subdlStatus);
     refreshList();
   </script>
 </body>
@@ -243,13 +394,13 @@ _COMPANION_HTML = """<!doctype html>
 
 @router.get("/companion", response_class=HTMLResponse)
 def companion_page() -> HTMLResponse:
-    """Serve the simple HTML upload page."""
-    return HTMLResponse(_COMPANION_HTML)
+    """Serve the companion HTML page."""
+    html = _COMPANION_HTML.replace(
+        "__SUBDL_STATUS_JSON__",
+        json.dumps(subdl_service.get_status()),
+    )
+    return HTMLResponse(html)
 
-
-# ---------------------------------------------------------------------------
-# Upload + list endpoints
-# ---------------------------------------------------------------------------
 
 _SAFE_VIDEO_ID = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -257,6 +408,50 @@ _SAFE_VIDEO_ID = re.compile(r"[^A-Za-z0-9._-]+")
 def _slug_video_id(video_id: str) -> str:
     """Sanitize a video_id so it's safe to use in a filename."""
     return _SAFE_VIDEO_ID.sub("_", video_id.strip()) or "unknown"
+
+
+def _store_english_srt_record(
+    *,
+    video_id: str,
+    video_type: str,
+    release_name: Optional[str],
+    text: str,
+) -> Dict[str, Any]:
+    """Persist a validated English SRT and return the record payload."""
+    english_hash = sha256_text(text)
+    english_dir = config.ENGLISH_CACHE_DIR
+    english_dir.mkdir(parents=True, exist_ok=True)
+    target = english_dir / "{0}_{1}.srt".format(
+        _slug_video_id(video_id),
+        english_hash[:12],
+    )
+    target.write_text(text, encoding="utf-8")
+
+    normalized_video_id = video_id.strip()
+    normalized_video_type = (video_type or "movie").strip() or "movie"
+    normalized_release_name = release_name.strip() if release_name else None
+    record_id = insert_subtitle(
+        config.DB_PATH,
+        video_id=normalized_video_id,
+        video_type=normalized_video_type,
+        release_name=normalized_release_name,
+        english_srt_path=str(target),
+        english_srt_hash=english_hash,
+        arabic_srt_path=None,
+        status="uploaded",
+    )
+
+    return {
+        "id": record_id,
+        "video_id": normalized_video_id,
+        "video_type": normalized_video_type,
+        "release_name": normalized_release_name,
+        "english_srt_path": str(target),
+        "english_srt_hash": english_hash,
+        "arabic_srt_path": None,
+        "status": "uploaded",
+        "error_message": None,
+    }
 
 
 @router.post("/companion/upload-srt")
@@ -282,34 +477,13 @@ async def upload_srt(
     except SRTValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    english_hash = sha256_text(text)
-    english_dir = config.ENGLISH_CACHE_DIR
-    english_dir.mkdir(parents=True, exist_ok=True)
-    target = english_dir / f"{_slug_video_id(video_id)}_{english_hash[:12]}.srt"
-    target.write_text(text, encoding="utf-8")
-
-    record_id = insert_subtitle(
-        config.DB_PATH,
-        video_id=video_id.strip(),
-        video_type=(video_type or "movie").strip() or "movie",
-        release_name=release_name.strip() if release_name else None,
-        english_srt_path=str(target),
-        english_srt_hash=english_hash,
-        arabic_srt_path=None,
-        status="uploaded",
-    )
-
     return JSONResponse(
-        {
-            "id": record_id,
-            "video_id": video_id.strip(),
-            "video_type": (video_type or "movie").strip() or "movie",
-            "release_name": release_name.strip() if release_name else None,
-            "english_srt_path": str(target),
-            "english_srt_hash": english_hash,
-            "arabic_srt_path": None,
-            "status": "uploaded",
-        }
+        _store_english_srt_record(
+            video_id=video_id,
+            video_type=video_type,
+            release_name=release_name,
+            text=text,
+        )
     )
 
 
@@ -322,12 +496,78 @@ def companion_list() -> Dict[str, Any]:
 @router.get("/companion/gemini-status")
 def gemini_status() -> Dict[str, Any]:
     """Return whether Gemini translation is currently configured."""
-    return get_status()
+    return get_gemini_status()
 
 
-# ---------------------------------------------------------------------------
-# Translate endpoint (Phase 3)
-# ---------------------------------------------------------------------------
+@router.get("/companion/search-subdl")
+def search_subdl(
+    video_id: str,
+    video_type: str = "movie",
+    season: Optional[int] = Query(None),
+    episode: Optional[int] = Query(None),
+    query: Optional[str] = Query(None),
+    language: str = Query("EN"),
+    release_name: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    """Search SubDL and return normalized subtitle candidates."""
+    try:
+        items = subdl_service.search_subtitles(
+            video_id=video_id,
+            video_type=video_type,
+            season=season,
+            episode=episode,
+            query=query,
+            language=language,
+            release_name=release_name,
+        )
+    except SubDLNotConfiguredError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SubDLError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"items": items}
+
+
+@router.post("/companion/import-subdl")
+async def import_subdl(request: Request) -> JSONResponse:
+    """Download an English SRT from SubDL, validate it, and add a DB record."""
+    content_type = request.headers.get("content-type", "").lower()
+    if "application/json" in content_type:
+        payload = await request.json()
+    else:
+        form = await request.form()
+        payload = dict(form)
+
+    video_id = str(payload.get("video_id") or "").strip()
+    video_type = str(payload.get("video_type") or "movie").strip() or "movie"
+    release_name = payload.get("release_name")
+    download_url = str(payload.get("download_url") or "").strip()
+
+    if not video_id:
+        raise HTTPException(status_code=400, detail="video_id is required")
+    if not download_url:
+        raise HTTPException(status_code=400, detail="download_url is required")
+
+    try:
+        raw = subdl_service.download_subtitle_data(download_url)
+        text = validate_srt_content(raw)
+    except SubDLNotConfiguredError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SRTValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except SubDLError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    normalized_release_name = (
+        str(release_name).strip() if release_name not in (None, "") else None
+    )
+    return JSONResponse(
+        _store_english_srt_record(
+            video_id=video_id,
+            video_type=video_type,
+            release_name=normalized_release_name,
+            text=text,
+        )
+    )
 
 
 @router.post("/companion/translate/{record_id}")
@@ -349,7 +589,7 @@ def translate_endpoint(record_id: int, force: bool = Query(False)) -> JSONRespon
     except TranslationFormatError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Translator returned unusable output: {exc}",
+            detail="Translator returned unusable output: {0}".format(exc),
         ) from exc
     except GeminiError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc

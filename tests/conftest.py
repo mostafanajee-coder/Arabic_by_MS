@@ -4,7 +4,7 @@
   and `from utils...` all work.
 * Auto-redirects the SQLite DB and cache directories to a temporary
   per-test location so tests never touch the real cache.
-* Strips any GEMINI_* env vars by default; individual tests opt-in.
+* Strips any GEMINI_* and SUBDL_* env vars by default; individual tests opt-in.
 """
 
 from __future__ import annotations
@@ -30,4 +30,6 @@ def isolated_storage(tmp_path, monkeypatch):
     # Default: no Gemini key. Tests that need one set it explicitly.
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    monkeypatch.delenv("SUBDL_API_KEY", raising=False)
+    monkeypatch.delenv("SUBDL_BASE_URL", raising=False)
     yield

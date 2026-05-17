@@ -27,6 +27,7 @@ from utils.srt_cleaner import (
     assert_complete,
     parse_numbered_translations,
 )
+from utils.srt_quality import SRTQualityError, validate_translated_entries
 
 PathLike = Union[str, Path]
 GeminiCall = Callable[[str], str]
@@ -97,9 +98,6 @@ def translate_record(
         raise RecordNotFoundError(f"No subtitle record with id={record_id}")
 
     try:
-        cache_db.clear_error_message(db_path, record_id)
-        record = cache_db.get_record(db_path, record_id) or record
-
         existing_arabic_path = record.get("arabic_srt_path")
         if (
             not force
@@ -108,6 +106,9 @@ def translate_record(
             and Path(existing_arabic_path).exists()
         ):
             return dict(record)
+
+        cache_db.reset_translation_progress(db_path, record_id, status="uploaded")
+        record = cache_db.get_record(db_path, record_id) or record
 
         english_path = Path(record["english_srt_path"])
         if not english_path.exists():
@@ -120,21 +121,76 @@ def translate_record(
         if gemini_call is None:
             gemini_call = gemini_service.generate  # raises GeminiNotConfiguredError lazily
 
+        chunks = list(chunk_entries(entries, size=chunk_size))
+        total_chunks = len(chunks)
+        cache_db.set_translation_progress(
+            db_path,
+            record_id,
+            total_chunks=total_chunks,
+            done_chunks=0,
+            progress_message="Starting translation (0/{0} chunks).".format(total_chunks),
+        )
+
         translated_entries: List[SRTEntry] = []
-        for chunk in chunk_entries(entries, size=chunk_size):
-            prompt = _build_prompt(chunk)
-            raw_reply = gemini_call(prompt)
-            translations = parse_numbered_translations(raw_reply)
-            assert_complete(translations, [e.index for e in chunk])
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            cache_db.set_translation_progress(
+                db_path,
+                record_id,
+                total_chunks=total_chunks,
+                done_chunks=chunk_index - 1,
+                progress_message="Translating chunk {0} of {1}.".format(
+                    chunk_index,
+                    total_chunks,
+                ),
+            )
+            try:
+                prompt = _build_prompt(chunk)
+                raw_reply = gemini_call(prompt)
+                translations = parse_numbered_translations(raw_reply)
+                assert_complete(translations, [e.index for e in chunk])
+            except (
+                TranslationFormatError,
+                gemini_service.GeminiError,
+                OSError,
+            ) as exc:
+                message = _short_error_message(
+                    "Chunk {0}/{1} failed: {2}".format(
+                        chunk_index,
+                        total_chunks,
+                        exc,
+                    )
+                )
+                cache_db.set_failed(
+                    db_path,
+                    record_id,
+                    message,
+                    progress_message="Failed on chunk {0} of {1}.".format(
+                        chunk_index,
+                        total_chunks,
+                    ),
+                )
+                raise
 
             for entry in chunk:
                 translated_entries.append(
                     SRTEntry(
                         index=entry.index,
                         timestamp=entry.timestamp,
-                        text=translations[entry.index],
+                        text=translations.get(entry.index, ""),
                     )
                 )
+            cache_db.set_translation_progress(
+                db_path,
+                record_id,
+                total_chunks=total_chunks,
+                done_chunks=chunk_index,
+                progress_message="Translated chunk {0} of {1}.".format(
+                    chunk_index,
+                    total_chunks,
+                ),
+            )
+
+        translated_entries = validate_translated_entries(entries, translated_entries)
         arabic_text = render_srt(translated_entries)
 
         out_dir = Path(arabic_cache_dir)
@@ -153,15 +209,23 @@ def translate_record(
         return dict(updated) if updated else {}
     except SRTParseError as exc:
         message = _short_error_message(f"Invalid English SRT: {exc}")
-        cache_db.set_failed(db_path, record_id, message)
+        cache_db.set_failed(db_path, record_id, message, progress_message="English SRT parsing failed.")
         raise TranslationFormatError(str(exc)) from exc
     except (
         EnglishFileMissingError,
         TranslationFormatError,
+        SRTQualityError,
         gemini_service.GeminiError,
         OSError,
     ) as exc:
-        cache_db.set_failed(db_path, record_id, _short_error_message(str(exc)))
+        current = cache_db.get_record(db_path, record_id) or {}
+        if current.get("status") != "failed" or not current.get("error_message"):
+            cache_db.set_failed(
+                db_path,
+                record_id,
+                _short_error_message(str(exc)),
+                progress_message="Translation failed.",
+            )
         raise
 
 

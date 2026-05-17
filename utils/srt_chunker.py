@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Iterable, Iterator, List
+from typing import Iterable, Iterator, List, Optional
 
 
 _TS_RE = re.compile(
@@ -83,17 +83,40 @@ def parse_srt(content: str) -> List[SRTEntry]:
 def render_srt(entries: Iterable[SRTEntry]) -> str:
     """Render a sequence of SRTEntry back to standard SRT text."""
     parts: List[str] = []
-    for i, e in enumerate(entries, start=1):
-        # Always re-number sequentially so the output is well-formed even
-        # if the input numbering had gaps.
-        parts.append(f"{i}\n{e.timestamp}\n{e.text}".rstrip())
+    for e in entries:
+        # Preserve the original cue index and timestamp exactly.
+        parts.append(f"{e.index}\n{e.timestamp}\n{e.text}".rstrip())
     # Trailing newline keeps players happy.
     return "\n\n".join(parts) + "\n"
 
 
-def chunk_entries(entries: List[SRTEntry], size: int = 20) -> Iterator[List[SRTEntry]]:
-    """Yield successive `size`-sized slices of `entries`."""
+def chunk_entries(
+    entries: List[SRTEntry],
+    size: int = 20,
+    *,
+    max_chars: Optional[int] = 1800,
+) -> Iterator[List[SRTEntry]]:
+    """Yield translation-safe chunks bounded by entry count and text size."""
     if size <= 0:
         raise ValueError("chunk size must be positive")
-    for i in range(0, len(entries), size):
-        yield entries[i : i + size]
+    if max_chars is not None and max_chars <= 0:
+        raise ValueError("max_chars must be positive when provided")
+
+    chunk: List[SRTEntry] = []
+    chunk_chars = 0
+    for entry in entries:
+        entry_chars = len(" ".join(entry.text.split()))
+        would_exceed_size = len(chunk) >= size
+        would_exceed_chars = (
+            bool(chunk)
+            and max_chars is not None
+            and chunk_chars + entry_chars > max_chars
+        )
+        if would_exceed_size or would_exceed_chars:
+            yield chunk
+            chunk = []
+            chunk_chars = 0
+        chunk.append(entry)
+        chunk_chars += entry_chars
+    if chunk:
+        yield chunk

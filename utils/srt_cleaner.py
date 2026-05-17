@@ -23,7 +23,7 @@ class TranslationFormatError(ValueError):
 
 # Matches lines like "1) text", "1. text", "1: text", "1- text",
 # with optional leading whitespace.
-_LINE_RE = re.compile(r"^\s*(\d+)\s*[\)\.\:\-]\s*(.+?)\s*$")
+_LINE_RE = re.compile(r"^\s*(\d+)\s*[\)\.\:\-]\s*(.*?)\s*$")
 
 
 def parse_numbered_translations(raw: str) -> Dict[int, str]:

@@ -19,6 +19,8 @@ from services.translation_service import (
     translate_record,
 )
 from utils.srt_cleaner import TranslationFormatError
+from utils.srt_chunker import SRTEntry, chunk_entries, parse_srt
+from utils.srt_quality import SRTQualityError, clean_translation_text, validate_translated_entries
 
 
 # ---- helpers -------------------------------------------------------------
@@ -33,6 +35,21 @@ VALID_SRT_BYTES = (
     "00:00:05,000 --> 00:00:08,000\n"
     "Second line\n"
 ).encode("utf-8")
+
+
+def _build_long_srt(num_entries: int) -> bytes:
+    blocks = []
+    for index in range(1, num_entries + 1):
+        start_sec = index
+        end_sec = index + 1
+        blocks.append(
+            "{0}\n00:00:{1:02d},000 --> 00:00:{2:02d},000\nLine {0}\n".format(
+                index,
+                start_sec,
+                end_sec,
+            )
+        )
+    return ("\n".join(blocks)).encode("utf-8")
 
 
 def _fake_translation_reply(prompt: str) -> str:
@@ -379,6 +396,174 @@ def test_translate_record_does_not_overwrite_without_force(tmp_path):
     assert arabic_file.read_text(encoding="utf-8") == "original arabic"
 
 
+def test_chunking_long_srt_into_multiple_chunks():
+    entries = parse_srt(_build_long_srt(7).decode("utf-8"))
+    chunks = list(chunk_entries(entries, size=3))
+    assert len(chunks) == 3
+    assert [len(chunk) for chunk in chunks] == [3, 3, 1]
+
+
+def test_successful_chunked_translation_reassembles_in_order(tmp_path):
+    english = tmp_path / "english"
+    english.mkdir()
+    arabic_dir = tmp_path / "arabic"
+    db = tmp_path / "subtitles.db"
+
+    en_file = english / "long.srt"
+    en_file.write_text(_build_long_srt(5).decode("utf-8"), encoding="utf-8")
+    rid = cache_db.insert_subtitle(
+        db,
+        video_id="ttlong1",
+        video_type="movie",
+        release_name=None,
+        english_srt_path=str(en_file),
+        english_srt_hash="hashlong123456",
+    )
+
+    result = translate_record(
+        db,
+        rid,
+        arabic_cache_dir=arabic_dir,
+        chunk_size=2,
+        gemini_call=_fake_translation_reply,
+    )
+    arabic_text = Path(result["arabic_srt_path"]).read_text(encoding="utf-8")
+    assert "1\n00:00:01,000 --> 00:00:02,000" in arabic_text
+    assert "5\n00:00:05,000 --> 00:00:06,000" in arabic_text
+    assert arabic_text.index("ترجمة: Line 1") < arabic_text.index("ترجمة: Line 5")
+
+
+def test_progress_fields_update_during_translation(tmp_path):
+    english = tmp_path / "english"
+    english.mkdir()
+    arabic_dir = tmp_path / "arabic"
+    db = tmp_path / "subtitles.db"
+
+    en_file = english / "progress.srt"
+    en_file.write_text(_build_long_srt(5).decode("utf-8"), encoding="utf-8")
+    rid = cache_db.insert_subtitle(
+        db,
+        video_id="ttprogress",
+        video_type="movie",
+        release_name=None,
+        english_srt_path=str(en_file),
+        english_srt_hash="progress123456",
+    )
+
+    call_count = {"value": 0}
+
+    def progress_aware_reply(prompt: str) -> str:
+        call_count["value"] += 1
+        if call_count["value"] == 2:
+            rec = cache_db.get_record(db, rid)
+            assert rec is not None
+            assert rec["status"] == "translating"
+            assert rec["progress_total_chunks"] == 3
+            assert rec["progress_done_chunks"] == 1
+            assert "chunk 2 of 3" in rec["progress_message"].lower()
+        return _fake_translation_reply(prompt)
+
+    result = translate_record(
+        db,
+        rid,
+        arabic_cache_dir=arabic_dir,
+        chunk_size=2,
+        gemini_call=progress_aware_reply,
+    )
+    assert result["status"] == "translated"
+    assert result["progress_total_chunks"] is None
+    assert result["progress_done_chunks"] is None
+    assert result["progress_message"] is None
+
+
+def test_translation_status_endpoint(client, uploaded_record):
+    resp = client.get(f"/companion/translation-status/{uploaded_record['id']}")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["record_id"] == uploaded_record["id"]
+    assert payload["status"] == "uploaded"
+    assert payload["progress_total_chunks"] is None
+    assert payload["progress_done_chunks"] is None
+    assert payload["progress_message"] is None
+    assert payload["arabic_available"] is False
+
+
+def test_failed_chunk_marks_record_failed(tmp_path):
+    english = tmp_path / "english"
+    english.mkdir()
+    arabic_dir = tmp_path / "arabic"
+    db = tmp_path / "subtitles.db"
+
+    en_file = english / "failed.srt"
+    en_file.write_text(_build_long_srt(5).decode("utf-8"), encoding="utf-8")
+    rid = cache_db.insert_subtitle(
+        db,
+        video_id="ttfailed",
+        video_type="movie",
+        release_name=None,
+        english_srt_path=str(en_file),
+        english_srt_hash="failed123456",
+    )
+
+    call_count = {"value": 0}
+
+    def fail_second_chunk(prompt: str) -> str:
+        call_count["value"] += 1
+        if call_count["value"] == 2:
+            raise gemini_service.GeminiError("network blew up")
+        return _fake_translation_reply(prompt)
+
+    with pytest.raises(gemini_service.GeminiError):
+        translate_record(
+            db,
+            rid,
+            arabic_cache_dir=arabic_dir,
+            chunk_size=2,
+            gemini_call=fail_second_chunk,
+        )
+    rec = cache_db.get_record(db, rid)
+    assert rec is not None
+    assert rec["status"] == "failed"
+    assert "chunk 2/3 failed" in rec["error_message"].lower()
+    assert "failed on chunk 2 of 3" in rec["progress_message"].lower()
+
+
+def test_empty_translated_block_is_rejected(client, uploaded_record, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-tests")
+
+    def empty_block_reply(prompt: str) -> str:
+        return "1) ترجمة: Hello world\n2)"
+
+    monkeypatch.setattr(gemini_service, "generate", empty_block_reply)
+
+    resp = client.post(f"/companion/translate/{uploaded_record['id']}")
+    assert resp.status_code == 502
+    assert "empty" in resp.json()["detail"].lower()
+
+
+def test_markdown_and_explanation_cleanup(client, uploaded_record, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-tests")
+
+    def messy_reply(prompt: str) -> str:
+        return (
+            "Here are your translations:\n"
+            "```\n"
+            "1) Translation: مرحبا بالعالم\n"
+            "2) Arabic: السطر الثاني\n"
+            "```"
+        )
+
+    monkeypatch.setattr(gemini_service, "generate", messy_reply)
+
+    resp = client.post(f"/companion/translate/{uploaded_record['id']}")
+    assert resp.status_code == 200, resp.text
+    arabic_text = Path(resp.json()["arabic_srt_path"]).read_text(encoding="utf-8")
+    assert "Translation:" not in arabic_text
+    assert "Arabic:" not in arabic_text
+    assert "```" not in arabic_text
+    assert "Here are your translations" not in arabic_text
+
+
 # ---- gemini_service config helper ---------------------------------------
 
 
@@ -428,3 +613,32 @@ def test_srt_cleaner_raises_when_no_lines():
     from utils.srt_cleaner import parse_numbered_translations
     with pytest.raises(TranslationFormatError):
         parse_numbered_translations("no numbers here at all")
+
+
+def test_srt_quality_rejects_timestamp_mismatch():
+    english = [SRTEntry(index=1, timestamp="00:00:01,000 --> 00:00:02,000", text="Hello")]
+    translated = [SRTEntry(index=1, timestamp="00:00:09,000 --> 00:00:10,000", text="مرحبا")]
+    with pytest.raises(SRTQualityError):
+        validate_translated_entries(english, translated)
+
+
+def test_srt_quality_rejects_block_count_mismatch():
+    english = [
+        SRTEntry(index=1, timestamp="00:00:01,000 --> 00:00:02,000", text="Hello"),
+        SRTEntry(index=2, timestamp="00:00:03,000 --> 00:00:04,000", text="World"),
+    ]
+    translated = [SRTEntry(index=1, timestamp="00:00:01,000 --> 00:00:02,000", text="مرحبا")]
+    with pytest.raises(SRTQualityError):
+        validate_translated_entries(english, translated)
+
+
+def test_srt_quality_rejects_empty_block():
+    english = [SRTEntry(index=1, timestamp="00:00:01,000 --> 00:00:02,000", text="Hello")]
+    translated = [SRTEntry(index=1, timestamp="00:00:01,000 --> 00:00:02,000", text="  ")]
+    with pytest.raises(SRTQualityError):
+        validate_translated_entries(english, translated)
+
+
+def test_clean_translation_text_strips_labels_and_fences():
+    cleaned = clean_translation_text("``` Translation: مرحبا ```")
+    assert cleaned == "مرحبا"

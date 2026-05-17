@@ -58,10 +58,10 @@ DB_PATH: Path = CACHE_DIR / "subtitles.db"
 
 ADDON_ID: str = os.getenv("ADDON_ID", "community.arabic.by.ms")
 ADDON_NAME: str = os.getenv("ADDON_NAME", "Arabic by M.S")
-ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.6.0")
+ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.8.0")
 ADDON_DESCRIPTION: str = os.getenv(
     "ADDON_DESCRIPTION",
-    "Arabic subtitles for Stremio. Phase 6 adds SubDL and SubSource search/import plus Gemini translation.",
+    "Arabic subtitles for Stremio. Phase 8 hardens Gemini translation with chunked progress tracking, safer retries, and Arabic SRT quality checks.",
 )
 
 # ---------------------------------------------------------------------------

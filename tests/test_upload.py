@@ -40,6 +40,7 @@ def test_companion_page_loads(client: TestClient) -> None:
     assert "Arabic by M.S" in response.text
     assert 'name="srt_file"' in response.text
     assert "Gemini status" in response.text
+    assert "Search All Providers" in response.text
     assert "Search SubDL" in response.text
     assert "Search SubSource" in response.text
 

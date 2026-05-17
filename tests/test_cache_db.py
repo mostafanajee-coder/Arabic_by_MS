@@ -12,8 +12,10 @@ from services.cache_db import (
     init_db,
     insert_subtitle,
     list_subtitles,
+    reset_translation_progress,
     set_failed,
     set_arabic_srt,
+    set_translation_progress,
 )
 
 
@@ -30,6 +32,9 @@ def test_insert_and_list_subtitles() -> None:
         release_name="Test.Movie",
         english_srt_path="/tmp/x.srt",
         english_srt_hash="abc123",
+        source_provider="subdl",
+        source_subtitle_id="123",
+        source_download_url="https://example.com/subtitle.zip",
     )
     assert rid >= 1
 
@@ -44,6 +49,12 @@ def test_insert_and_list_subtitles() -> None:
     assert row["arabic_srt_path"] is None
     assert row["status"] == "uploaded"
     assert row["error_message"] is None
+    assert row["source_provider"] == "subdl"
+    assert row["source_subtitle_id"] == "123"
+    assert row["source_download_url"] == "https://example.com/subtitle.zip"
+    assert row["progress_total_chunks"] is None
+    assert row["progress_done_chunks"] is None
+    assert row["progress_message"] is None
     assert row["created_at"].endswith("Z")
 
 
@@ -118,6 +129,12 @@ def test_init_db_adds_error_message_column_to_existing_db(tmp_path) -> None:
             for row in conn.execute("PRAGMA table_info(subtitles)").fetchall()
         }
     assert "error_message" in columns
+    assert "source_provider" in columns
+    assert "source_subtitle_id" in columns
+    assert "source_download_url" in columns
+    assert "progress_total_chunks" in columns
+    assert "progress_done_chunks" in columns
+    assert "progress_message" in columns
 
 
 def test_set_failed_and_clear_error_message() -> None:
@@ -140,3 +157,36 @@ def test_set_failed_and_clear_error_message() -> None:
     cleared = get_record(config.DB_PATH, rid)
     assert cleared is not None
     assert cleared["error_message"] is None
+
+
+def test_translation_progress_helpers() -> None:
+    rid = insert_subtitle(
+        config.DB_PATH,
+        video_id="tt5555555",
+        video_type="movie",
+        release_name=None,
+        english_srt_path="/tmp/e.srt",
+        english_srt_hash="eee",
+    )
+
+    set_translation_progress(
+        config.DB_PATH,
+        rid,
+        total_chunks=5,
+        done_chunks=2,
+        progress_message="Translated chunk 2 of 5.",
+    )
+    rec = get_record(config.DB_PATH, rid)
+    assert rec is not None
+    assert rec["status"] == "translating"
+    assert rec["progress_total_chunks"] == 5
+    assert rec["progress_done_chunks"] == 2
+    assert rec["progress_message"] == "Translated chunk 2 of 5."
+
+    reset_translation_progress(config.DB_PATH, rid, status="uploaded")
+    reset = get_record(config.DB_PATH, rid)
+    assert reset is not None
+    assert reset["status"] == "uploaded"
+    assert reset["progress_total_chunks"] is None
+    assert reset["progress_done_chunks"] is None
+    assert reset["progress_message"] is None

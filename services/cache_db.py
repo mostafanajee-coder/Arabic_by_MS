@@ -11,6 +11,12 @@ Schema (single table `subtitles`):
     arabic_srt_path   TEXT                         (nullable in Phase 2)
     status            TEXT NOT NULL DEFAULT 'uploaded'
     error_message     TEXT
+    source_provider   TEXT                         (nullable in Phase 7)
+    source_subtitle_id TEXT                        (nullable in Phase 7)
+    source_download_url TEXT                       (nullable in Phase 7)
+    progress_total_chunks INTEGER                  (nullable in Phase 8)
+    progress_done_chunks INTEGER                   (nullable in Phase 8)
+    progress_message  TEXT                         (nullable in Phase 8)
     created_at        TEXT NOT NULL                ISO-8601 UTC timestamp
 
 All functions take an explicit `db_path` so tests can use a temp database.
@@ -36,6 +42,12 @@ CREATE TABLE IF NOT EXISTS subtitles (
     arabic_srt_path TEXT,
     status TEXT NOT NULL DEFAULT 'uploaded',
     error_message TEXT,
+    source_provider TEXT,
+    source_subtitle_id TEXT,
+    source_download_url TEXT,
+    progress_total_chunks INTEGER,
+    progress_done_chunks INTEGER,
+    progress_message TEXT,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_subtitles_video_id ON subtitles(video_id);
@@ -58,6 +70,18 @@ def init_db(db_path: PathLike) -> None:
         }
         if "error_message" not in columns:
             conn.execute("ALTER TABLE subtitles ADD COLUMN error_message TEXT")
+        if "source_provider" not in columns:
+            conn.execute("ALTER TABLE subtitles ADD COLUMN source_provider TEXT")
+        if "source_subtitle_id" not in columns:
+            conn.execute("ALTER TABLE subtitles ADD COLUMN source_subtitle_id TEXT")
+        if "source_download_url" not in columns:
+            conn.execute("ALTER TABLE subtitles ADD COLUMN source_download_url TEXT")
+        if "progress_total_chunks" not in columns:
+            conn.execute("ALTER TABLE subtitles ADD COLUMN progress_total_chunks INTEGER")
+        if "progress_done_chunks" not in columns:
+            conn.execute("ALTER TABLE subtitles ADD COLUMN progress_done_chunks INTEGER")
+        if "progress_message" not in columns:
+            conn.execute("ALTER TABLE subtitles ADD COLUMN progress_message TEXT")
         conn.commit()
 
 
@@ -79,6 +103,12 @@ def insert_subtitle(
     arabic_srt_path: Optional[str] = None,
     status: str = "uploaded",
     error_message: Optional[str] = None,
+    source_provider: Optional[str] = None,
+    source_subtitle_id: Optional[str] = None,
+    source_download_url: Optional[str] = None,
+    progress_total_chunks: Optional[int] = None,
+    progress_done_chunks: Optional[int] = None,
+    progress_message: Optional[str] = None,
 ) -> int:
     """Insert a new subtitle record and return the new row id."""
     created_at = _utcnow_iso()
@@ -88,8 +118,11 @@ def insert_subtitle(
             INSERT INTO subtitles (
                 video_id, video_type, release_name,
                 english_srt_path, english_srt_hash,
-                arabic_srt_path, status, error_message, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                arabic_srt_path, status, error_message,
+                source_provider, source_subtitle_id, source_download_url,
+                progress_total_chunks, progress_done_chunks, progress_message,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 video_id,
@@ -100,6 +133,12 @@ def insert_subtitle(
                 arabic_srt_path,
                 status,
                 error_message,
+                source_provider,
+                source_subtitle_id,
+                source_download_url,
+                progress_total_chunks,
+                progress_done_chunks,
+                progress_message,
                 created_at,
             ),
         )
@@ -137,7 +176,7 @@ def find_latest_arabic_for_video(
         row = conn.execute(
             """
             SELECT * FROM subtitles
-            WHERE video_id = ? AND arabic_srt_path IS NOT NULL
+            WHERE video_id = ? AND arabic_srt_path IS NOT NULL AND status = 'translated'
             ORDER BY id DESC LIMIT 1
             """,
             (video_id,),
@@ -157,7 +196,10 @@ def set_arabic_srt(
         conn.execute(
             """
             UPDATE subtitles
-            SET arabic_srt_path = ?, status = ?, error_message = ?
+            SET arabic_srt_path = ?, status = ?, error_message = ?,
+                progress_total_chunks = NULL,
+                progress_done_chunks = NULL,
+                progress_message = NULL
             WHERE id = ?
             """,
             (arabic_srt_path, status, error_message, record_id),
@@ -171,12 +213,17 @@ def set_failed(
     error_message: Optional[str],
     *,
     status: str = "failed",
+    progress_message: Optional[str] = None,
 ) -> None:
     """Mark a subtitle record as failed and store a short error message."""
     with _connect(db_path) as conn:
         conn.execute(
-            "UPDATE subtitles SET status = ?, error_message = ? WHERE id = ?",
-            (status, error_message, record_id),
+            """
+            UPDATE subtitles
+            SET status = ?, error_message = ?, progress_message = ?
+            WHERE id = ?
+            """,
+            (status, error_message, progress_message, record_id),
         )
         conn.commit()
 
@@ -187,5 +234,67 @@ def clear_error_message(db_path: PathLike, record_id: int) -> None:
         conn.execute(
             "UPDATE subtitles SET error_message = NULL WHERE id = ?",
             (record_id,),
+        )
+        conn.commit()
+
+
+def reset_translation_progress(
+    db_path: PathLike,
+    record_id: int,
+    *,
+    status: Optional[str] = None,
+) -> None:
+    """Clear stored translation errors and progress fields for a retry."""
+    with _connect(db_path) as conn:
+        if status is None:
+            conn.execute(
+                """
+                UPDATE subtitles
+                SET error_message = NULL,
+                    progress_total_chunks = NULL,
+                    progress_done_chunks = NULL,
+                    progress_message = NULL
+                WHERE id = ?
+                """,
+                (record_id,),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE subtitles
+                SET status = ?,
+                    error_message = NULL,
+                    progress_total_chunks = NULL,
+                    progress_done_chunks = NULL,
+                    progress_message = NULL
+                WHERE id = ?
+                """,
+                (status, record_id),
+            )
+        conn.commit()
+
+
+def set_translation_progress(
+    db_path: PathLike,
+    record_id: int,
+    *,
+    total_chunks: Optional[int],
+    done_chunks: Optional[int],
+    progress_message: Optional[str],
+    status: str = "translating",
+) -> None:
+    """Persist chunked-translation progress for a record."""
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE subtitles
+            SET status = ?,
+                progress_total_chunks = ?,
+                progress_done_chunks = ?,
+                progress_message = ?,
+                error_message = NULL
+            WHERE id = ?
+            """,
+            (status, total_chunks, done_chunks, progress_message, record_id),
         )
         conn.commit()

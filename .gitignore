@@ -1,0 +1,34 @@
+# Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE / System
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Project-specific caches
+.pytest_cache/
+pytest-cache-files-*/
+.cache/
+
+# Local configuration files
+.env
+.env.local
+
+# Databases & local user files
+Arabic_by_MS.zip
+cache/subtitles.db
+cache/subtitles.db-journal
+cache/english/*
+!cache/english/.gitkeep
+cache/arabic/*
+!cache/arabic/sample_arabic.srt

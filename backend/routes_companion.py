@@ -10,12 +10,12 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import config
 from services.cache_db import insert_subtitle, list_subtitles
-from services.gemini_service import GeminiError, GeminiNotConfiguredError
+from services.gemini_service import GeminiError, GeminiNotConfiguredError, get_status
 from services.translation_service import (
     EnglishFileMissingError,
     RecordNotFoundError,
@@ -68,14 +68,19 @@ _COMPANION_HTML = """<!doctype html>
              font-size: 0.75rem; font-weight: 600; }
     .badge.done { background: #d1fae5; color: #065f46; }
     .badge.pending { background: #fef3c7; color: #92400e; }
+    .badge.failed { background: #fee2e2; color: #991b1b; }
     code { background: #f3f4f6; padding: 0 0.25rem; border-radius: 3px; }
     .empty { color: #6b7280; font-style: italic; }
     .row-msg { font-size: 0.8rem; margin-top: 0.25rem; }
+    .status-panel { margin: 1rem 0; }
+    .actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
   </style>
 </head>
 <body>
   <h1>Arabic by M.S — Companion</h1>
   <p class="sub">Upload an English <code>.srt</code>, then translate it to Arabic via Gemini.</p>
+
+  <div id="gemini-status" class="status-panel msg">Checking Gemini configuration…</div>
 
   <form id="form" enctype="multipart/form-data">
     <label for="video_id">Video ID <span style="color:#dc2626">*</span> (e.g. <code>tt1234567</code>)</label>
@@ -102,20 +107,54 @@ _COMPANION_HTML = """<!doctype html>
   <div id="list" class="empty">Loading…</div>
 
   <script>
+    let geminiStatus = { configured: false, model: '', message: 'Checking Gemini configuration…' };
+
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, c => ({
         '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"
       })[c]);
     }
 
-    async function translateRecord(recordId, btn) {
+    function renderGeminiStatus(status) {
+      geminiStatus = status;
+      const el = document.getElementById('gemini-status');
+      const klass = status.configured ? 'msg ok' : 'msg err';
+      el.className = 'status-panel ' + klass;
+      el.innerHTML =
+        '<strong>Gemini status:</strong> ' +
+        escapeHtml(status.configured ? 'Configured' : 'Not configured') +
+        ' (<code>' + escapeHtml(status.model) + '</code>)<br />' +
+        escapeHtml(status.message);
+    }
+
+    async function refreshGeminiStatus() {
+      try {
+        const res = await fetch('/companion/gemini-status');
+        const data = await res.json();
+        renderGeminiStatus(data);
+      } catch (err) {
+        renderGeminiStatus({
+          configured: false,
+          model: 'unknown',
+          message: 'Failed to load Gemini status: ' + err.message
+        });
+      }
+    }
+
+    async function translateRecord(recordId, btn, force) {
+      const msg = document.getElementById('row-msg-' + recordId);
+      if (!geminiStatus.configured) {
+        if (msg) msg.innerHTML = '<span class="msg err">' + escapeHtml(geminiStatus.message) + '</span>';
+        return;
+      }
+
       btn.disabled = true;
       const original = btn.textContent;
       btn.textContent = 'Translating…';
-      const msg = document.getElementById('row-msg-' + recordId);
       if (msg) msg.innerHTML = '';
       try {
-        const res = await fetch('/companion/translate/' + recordId, { method: 'POST' });
+        const suffix = force ? '?force=true' : '';
+        const res = await fetch('/companion/translate/' + recordId + suffix, { method: 'POST' });
         const data = await res.json();
         if (!res.ok) {
           if (msg) msg.innerHTML = '<span class="msg err">' + escapeHtml(data.detail || 'Translate failed') + '</span>';
@@ -140,17 +179,24 @@ _COMPANION_HTML = """<!doctype html>
           return;
         }
         const rows = data.items.map(r => {
-          const action = r.arabic_srt_path
-            ? '<span class="badge done">Arabic available</span>'
-            : '<button onclick="_translateRecord(' + r.id + ', this)">Translate</button>';
+          const badgeClass = r.status === 'translated'
+            ? 'done'
+            : (r.status === 'failed' ? 'failed' : 'pending');
+          let action = '<button onclick="_translateRecord(' + r.id + ', this, false)">Translate</button>';
+          if (r.status === 'failed') {
+            action = '<button onclick="_translateRecord(' + r.id + ', this, false)">Retry Translate</button>';
+          } else if (r.arabic_srt_path) {
+            action = '<span class="badge done">Arabic available</span>';
+          }
           return `
             <tr>
               <td>${r.id}</td>
               <td>${escapeHtml(r.video_id)}</td>
               <td>${escapeHtml(r.video_type)}</td>
               <td>${escapeHtml(r.release_name || '')}</td>
-              <td><span class="badge ${r.status === 'translated' ? 'done' : 'pending'}">${escapeHtml(r.status)}</span></td>
-              <td>${action}<div class="row-msg" id="row-msg-${r.id}"></div></td>
+              <td><span class="badge ${badgeClass}">${escapeHtml(r.status)}</span></td>
+              <td>${escapeHtml(r.error_message || '')}</td>
+              <td><div class="actions">${action}</div><div class="row-msg" id="row-msg-${r.id}"></div></td>
               <td>${escapeHtml(r.created_at)}</td>
             </tr>`;
         }).join('');
@@ -158,7 +204,7 @@ _COMPANION_HTML = """<!doctype html>
         list.innerHTML = `<table>
           <thead><tr>
             <th>#</th><th>Video ID</th><th>Type</th><th>Release</th>
-            <th>Status</th><th>Action</th><th>Created (UTC)</th>
+            <th>Status</th><th>Error</th><th>Action</th><th>Created (UTC)</th>
           </tr></thead>
           <tbody>${rows}</tbody>
         </table>`;
@@ -187,6 +233,7 @@ _COMPANION_HTML = """<!doctype html>
       }
     });
 
+    refreshGeminiStatus();
     refreshList();
   </script>
 </body>
@@ -272,19 +319,26 @@ def companion_list() -> Dict[str, Any]:
     return {"items": list_subtitles(config.DB_PATH)}
 
 
+@router.get("/companion/gemini-status")
+def gemini_status() -> Dict[str, Any]:
+    """Return whether Gemini translation is currently configured."""
+    return get_status()
+
+
 # ---------------------------------------------------------------------------
 # Translate endpoint (Phase 3)
 # ---------------------------------------------------------------------------
 
 
 @router.post("/companion/translate/{record_id}")
-def translate_endpoint(record_id: int) -> JSONResponse:
+def translate_endpoint(record_id: int, force: bool = Query(False)) -> JSONResponse:
     """Translate the English SRT for `record_id` and persist the Arabic file."""
     try:
         updated = translate_record(
             config.DB_PATH,
             record_id,
             arabic_cache_dir=config.ARABIC_CACHE_DIR,
+            force=force,
         )
     except GeminiNotConfiguredError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -309,5 +363,6 @@ def translate_endpoint(record_id: int) -> JSONResponse:
             "video_type": updated.get("video_type"),
             "status": updated.get("status"),
             "arabic_srt_path": updated.get("arabic_srt_path"),
+            "error_message": updated.get("error_message"),
         }
     )

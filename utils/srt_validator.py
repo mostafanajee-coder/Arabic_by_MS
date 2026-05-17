@@ -9,7 +9,7 @@ Phase 2 only needs basic sanity checks:
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 class SRTValidationError(ValueError):
@@ -33,7 +33,7 @@ def validate_srt_filename(filename: str) -> None:
         raise SRTValidationError("Only .srt files are accepted")
 
 
-def _try_decode(data: bytes) -> str | None:
+def _try_decode(data: bytes) -> Optional[str]:
     # UTF-8 (with or without BOM) first — most common case.
     for enc in ("utf-8-sig", "utf-8"):
         try:

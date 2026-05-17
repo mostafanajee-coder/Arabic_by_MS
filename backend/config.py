@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -25,7 +26,7 @@ from dotenv import load_dotenv
 BASE_DIR: Path = Path(__file__).resolve().parent.parent
 
 
-def load_environment(env_path: Path | None = None) -> bool:
+def load_environment(env_path: Optional[Path] = None) -> bool:
     """Load environment variables from `.env` without overriding real env vars."""
     target = env_path or (BASE_DIR / ".env")
     return load_dotenv(target, override=False)

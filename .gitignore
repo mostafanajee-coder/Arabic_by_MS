@@ -25,7 +25,7 @@ pytest-cache-files-*/
 .env.local
 
 # Databases & local user files
-Arabic_by_MS.zip
+*.zip
 cache/subtitles.db
 cache/subtitles.db-journal
 cache/english/*

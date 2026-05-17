@@ -14,7 +14,7 @@ keeps the ones matching the numbered shape, and ignores the rest.
 from __future__ import annotations
 
 import re
-from typing import Dict
+from typing import Dict, List
 
 
 class TranslationFormatError(ValueError):
@@ -53,7 +53,7 @@ def parse_numbered_translations(raw: str) -> Dict[int, str]:
     return out
 
 
-def assert_complete(translations: Dict[int, str], expected_indices: list[int]) -> None:
+def assert_complete(translations: Dict[int, str], expected_indices: List[int]) -> None:
     """Raise TranslationFormatError if any expected index is missing."""
     missing = [i for i in expected_indices if i not in translations]
     if missing:

@@ -76,6 +76,30 @@ def test_translate_returns_400_when_gemini_api_key_missing(client, uploaded_reco
     assert resp.status_code == 400
     body = resp.json()
     assert "GEMINI_API_KEY" in body["detail"]
+    rec = cache_db.get_record(config.DB_PATH, uploaded_record["id"])
+    assert rec["status"] == "failed"
+    assert "GEMINI_API_KEY" in rec["error_message"]
+
+
+def test_gemini_status_reports_missing_key(client):
+    resp = client.get("/companion/gemini-status")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["configured"] is False
+    assert payload["model"] == gemini_service.DEFAULT_MODEL
+    assert "GEMINI_API_KEY" in payload["message"]
+
+
+def test_gemini_status_reports_configured_key(client, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-tests")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.0-pro")
+
+    resp = client.get("/companion/gemini-status")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["configured"] is True
+    assert payload["model"] == "gemini-2.0-pro"
+    assert "ready" in payload["message"].lower()
 
 
 # ---- route: successful translation (mocked) -----------------------------
@@ -135,10 +159,15 @@ def test_translate_rejects_malformed_gemini_output(client, uploaded_record, monk
     assert resp.status_code == 502
     assert "unusable" in resp.json()["detail"].lower() or "numbered" in resp.json()["detail"].lower()
 
-    # DB must NOT have been updated.
+    # DB must persist the failure.
     rec = cache_db.get_record(config.DB_PATH, uploaded_record["id"])
-    assert rec["status"] == "uploaded"
+    assert rec["status"] == "failed"
     assert rec["arabic_srt_path"] is None
+    assert rec["error_message"]
+
+    listed = client.get("/companion/list").json()["items"][0]
+    assert listed["status"] == "failed"
+    assert listed["error_message"] == rec["error_message"]
 
 
 def test_translate_rejects_partial_gemini_output(client, uploaded_record, monkeypatch):
@@ -152,7 +181,9 @@ def test_translate_rejects_partial_gemini_output(client, uploaded_record, monkey
     resp = client.post(f"/companion/translate/{uploaded_record['id']}")
     assert resp.status_code == 502
     rec = cache_db.get_record(config.DB_PATH, uploaded_record["id"])
+    assert rec["status"] == "failed"
     assert rec["arabic_srt_path"] is None
+    assert rec["error_message"]
 
 
 # ---- route: record / file lookup failures -------------------------------
@@ -177,6 +208,76 @@ def test_translate_english_file_missing(client, uploaded_record, monkeypatch):
     resp = client.post(f"/companion/translate/{uploaded_record['id']}")
     assert resp.status_code == 404
     assert "missing" in resp.json()["detail"].lower()
+    rec = cache_db.get_record(config.DB_PATH, uploaded_record["id"])
+    assert rec["status"] == "failed"
+    assert "missing" in rec["error_message"].lower()
+
+
+def test_retry_clears_error_and_succeeds(client, uploaded_record, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-tests")
+    monkeypatch.setattr(gemini_service, "generate", lambda prompt: "bad output")
+
+    failed = client.post(f"/companion/translate/{uploaded_record['id']}")
+    assert failed.status_code == 502
+    failed_record = cache_db.get_record(config.DB_PATH, uploaded_record["id"])
+    assert failed_record["status"] == "failed"
+    assert failed_record["error_message"]
+
+    monkeypatch.setattr(gemini_service, "generate", _fake_translation_reply)
+
+    retried = client.post(f"/companion/translate/{uploaded_record['id']}")
+    assert retried.status_code == 200, retried.text
+    payload = retried.json()
+    assert payload["status"] == "translated"
+    assert payload["error_message"] is None
+
+    rec = cache_db.get_record(config.DB_PATH, uploaded_record["id"])
+    assert rec["status"] == "translated"
+    assert rec["error_message"] is None
+    assert Path(rec["arabic_srt_path"]).exists()
+
+
+def test_translated_record_is_not_overwritten_without_force(
+    client, uploaded_record, monkeypatch
+):
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-tests")
+    monkeypatch.setattr(gemini_service, "generate", _fake_translation_reply)
+
+    first = client.post(f"/companion/translate/{uploaded_record['id']}")
+    assert first.status_code == 200, first.text
+    path = Path(first.json()["arabic_srt_path"])
+    original_text = path.read_text(encoding="utf-8")
+
+    def should_not_run(prompt: str) -> str:
+        raise AssertionError("Gemini should not run when force=false and Arabic file exists")
+
+    monkeypatch.setattr(gemini_service, "generate", should_not_run)
+
+    second = client.post(f"/companion/translate/{uploaded_record['id']}")
+    assert second.status_code == 200, second.text
+    assert second.json()["status"] == "translated"
+    assert path.read_text(encoding="utf-8") == original_text
+
+
+def test_force_true_overwrites_existing_arabic_file(client, uploaded_record, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-tests")
+    monkeypatch.setattr(gemini_service, "generate", _fake_translation_reply)
+
+    first = client.post(f"/companion/translate/{uploaded_record['id']}")
+    assert first.status_code == 200, first.text
+    path = Path(first.json()["arabic_srt_path"])
+    original_text = path.read_text(encoding="utf-8")
+
+    def forced_translation(prompt: str) -> str:
+        return _fake_translation_reply(prompt).replace("ترجمة:", "إعادة ترجمة:")
+
+    monkeypatch.setattr(gemini_service, "generate", forced_translation)
+
+    second = client.post(f"/companion/translate/{uploaded_record['id']}?force=true")
+    assert second.status_code == 200, second.text
+    updated_text = path.read_text(encoding="utf-8")
+    assert updated_text != original_text
+    assert "إعادة ترجمة:" in updated_text
 
 
 # ---- service-layer unit tests -------------------------------------------
@@ -236,6 +337,46 @@ def test_translate_record_unit_raises_on_missing_english_file(tmp_path):
             arabic_cache_dir=tmp_path / "arabic",
             gemini_call=_fake_translation_reply,
         )
+    rec = cache_db.get_record(db, rid)
+    assert rec["status"] == "failed"
+    assert "missing" in rec["error_message"].lower()
+
+
+def test_translate_record_does_not_overwrite_without_force(tmp_path):
+    english = tmp_path / "english"
+    english.mkdir()
+    arabic_dir = tmp_path / "arabic"
+    arabic_dir.mkdir()
+    db = tmp_path / "subtitles.db"
+
+    en_file = english / "x.srt"
+    en_file.write_text(VALID_SRT_BYTES.decode("utf-8"), encoding="utf-8")
+    arabic_file = arabic_dir / "tt0003_abc123456789.ar.srt"
+    arabic_file.write_text("original arabic", encoding="utf-8")
+
+    rid = cache_db.insert_subtitle(
+        db,
+        video_id="tt0003",
+        video_type="movie",
+        release_name=None,
+        english_srt_path=str(en_file),
+        english_srt_hash="abc1234567890def",
+        arabic_srt_path=str(arabic_file),
+        status="translated",
+    )
+
+    def should_not_run(prompt: str) -> str:
+        raise AssertionError("gemini_call should not run")
+
+    result = translate_record(
+        db,
+        rid,
+        arabic_cache_dir=arabic_dir,
+        gemini_call=should_not_run,
+    )
+
+    assert result["status"] == "translated"
+    assert arabic_file.read_text(encoding="utf-8") == "original arabic"
 
 
 # ---- gemini_service config helper ---------------------------------------

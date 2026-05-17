@@ -39,6 +39,7 @@ def test_companion_page_loads(client: TestClient) -> None:
     assert response.headers["content-type"].startswith("text/html")
     assert "Arabic by M.S" in response.text
     assert 'name="srt_file"' in response.text
+    assert "Gemini status" in response.text
 
 
 # ---- upload --------------------------------------------------------------
@@ -123,6 +124,7 @@ def test_companion_list_returns_uploaded_records(client: TestClient) -> None:
     assert len(items) == 1
     assert items[0]["video_id"] == "tt5555555"
     assert items[0]["video_type"] == "series"
+    assert "error_message" in items[0]
 
 
 # ---- subtitles endpoint cache fallback ----------------------------------

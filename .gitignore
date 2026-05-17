@@ -25,7 +25,14 @@ pytest-cache-files-*/
 .env.local
 
 # Databases & local user files
+# Compressed archives
 *.zip
+*.rar
+*.7z
+*.tar
+*.gz
+*.tgz
+*.zipx
 cache/subtitles.db
 cache/subtitles.db-journal
 cache/english/*

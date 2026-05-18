@@ -33,7 +33,7 @@ def test_health_endpoint(client: TestClient) -> None:
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["app"] == "Arabic by M.S"
-    assert payload["version"] == "0.12.0"
+    assert payload["version"] == "0.13.0"
     assert payload["status"] == "ok"
     assert payload["cache_db_ready"] is True
     assert payload["cache_dirs_ready"] is True
@@ -45,7 +45,7 @@ def test_install_info_endpoint(client: TestClient) -> None:
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["addon_name"] == "Arabic by M.S"
-    assert payload["version"] == "0.12.0"
+    assert payload["version"] == "0.13.0"
     assert payload["manifest_url"].endswith("/manifest.json")
     assert payload["companion_url"].endswith("/companion")
     assert payload["base_url"] == "http://testserver"
@@ -74,6 +74,8 @@ def test_companion_diagnostics(client: TestClient) -> None:
     assert payload["active_translation_jobs"] == 0
     assert payload["status_subtitle_ready"] is True
     assert payload["stremio_id_parser_ready"] is True
+    assert payload["srt_timing_ready"] is True
+    assert payload["preferred_record_ready"] is True
 
 
 def test_companion_test_gemini_missing_key(client: TestClient) -> None:

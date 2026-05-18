@@ -47,6 +47,9 @@ def test_insert_and_list_subtitles() -> None:
     assert row["english_srt_path"] == "/tmp/x.srt"
     assert row["english_srt_hash"] == "abc123"
     assert row["arabic_srt_path"] is None
+    assert row["timing_offset_ms"] is None
+    assert row["user_note"] is None
+    assert row["is_preferred"] == 0
     assert row["status"] == "uploaded"
     assert row["error_message"] is None
     assert row["source_provider"] == "subdl"
@@ -132,6 +135,9 @@ def test_init_db_adds_error_message_column_to_existing_db(tmp_path) -> None:
     assert "season" in columns
     assert "episode" in columns
     assert "canonical_video_key" in columns
+    assert "timing_offset_ms" in columns
+    assert "user_note" in columns
+    assert "is_preferred" in columns
     assert "error_message" in columns
     assert "source_provider" in columns
     assert "source_subtitle_id" in columns

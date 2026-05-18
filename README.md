@@ -42,6 +42,11 @@ A FastAPI Stremio subtitle addon that serves Arabic subtitles.
   addon now parses both `tt1234567` and `tt1234567:1:5`, stores canonical
   video identity in SQLite, and only returns cached Arabic subtitles for the
   exact movie or episode that was translated/imported.
+* **Phase 13** — subtitle preview, timing offsets, and preferred record
+  management. You can now preview cached English/Arabic cues, shift subtitle
+  timing without losing the previous file, save short notes such as
+  release-group hints, and mark the preferred translated record for the exact
+  movie or episode.
 
 Nvidia and OpenSubtitles are **not** wired up yet.
 SubDL and SubSource are the currently supported external search/import providers.
@@ -75,6 +80,7 @@ Arabic_by_MS/
 │   ├── srt_chunker.py         # Parse / render / chunk SRT
 │   ├── srt_cleaner.py         # Parse Gemini's numbered replies
 │   ├── srt_quality.py         # Arabic translation cleanup + validation
+│   ├── srt_timing.py          # Safe SRT timestamp shifting helpers
 │   ├── stremio_id.py          # Parse Stremio movie / episode ids safely
 │   ├── status_srt.py          # Generated Stremio-facing status subtitles
 │   └── subtitle_matcher.py    # Provider result scoring / ranking
@@ -94,7 +100,8 @@ Arabic_by_MS/
 │   ├── test_phase7_provider_router.py  # Phase 7 unified router/import-best
 │   ├── test_phase9_local_integration.py # Phase 9 local health/install/diagnostics
 │   ├── test_phase10_background_jobs.py # Phase 10 background job polling
-│   └── test_phase12_episode_identity.py # Phase 12 episode-aware matching
+│   ├── test_phase12_episode_identity.py # Phase 12 episode-aware matching
+│   └── test_phase13_preview_timing_preferred.py # Phase 13 preview/timing/preferred
 ├── requirements.txt
 ├── run.bat
 ├── .env.example
@@ -151,6 +158,10 @@ uvicorn backend.main:app --reload --port 8787
 | `POST /companion/translate-background/{record_id}` | Queue a background translation job        |
 | `GET /companion/translation-status/{record_id}` | Translation progress / error state for one record |
 | `GET /companion/job-status/{job_id}`          | Background translation job status + progress |
+| `GET /companion/preview/{record_id}`          | Preview cached English or Arabic subtitle cues |
+| `POST /companion/adjust-timing/{record_id}`   | Shift subtitle timing for English, Arabic, or both |
+| `POST /companion/set-preferred/{record_id}`   | Prefer one translated Arabic record for that exact canonical video |
+| `POST /companion/update-note/{record_id}`     | Save a short user note for one record |
 | `POST /companion/test-gemini`                 | Optional tiny Gemini smoke test               |
 | `POST /companion/self-test`                   | Safe local DB/cache/translation-status self-test |
 
@@ -165,6 +176,10 @@ Canonical cache keys are stored as:
 
 * movie: `tt1234567`
 * episode: `tt1234567:s01e05`
+
+Phase 13 builds on that exact canonical identity. Preferred-record selection
+and subtitle matching are scoped to the exact movie or episode key, so one
+episode can never take another episode's translated Arabic subtitle.
 
 ## Installing the addon in Stremio
 
@@ -219,6 +234,12 @@ page during translation. Existing translated files are reused unless
    Gemini is configured, the same form can auto-translate it after import.
 7. For series, you can pass either `video_id=tt1234567:1:5` or
    `video_id=tt1234567` together with `season=1` and `episode=5`.
+8. Open **Preview English** or **Preview Arabic** from the companion list to
+   inspect cues before choosing a preferred record or applying a timing offset.
+9. Use **Adjust Timing** or the quick `+500ms` / `-500ms` Arabic actions to
+   shift subtitle timing while preserving the previous file.
+10. Use **Set Preferred** to pin the translated Arabic record Stremio should
+    serve first for that exact canonical movie or episode.
 
 ## Running the tests
 

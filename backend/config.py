@@ -60,10 +60,10 @@ DB_PATH: Path = CACHE_DIR / "subtitles.db"
 
 ADDON_ID: str = os.getenv("ADDON_ID", "community.arabic.by.ms")
 ADDON_NAME: str = os.getenv("ADDON_NAME", "Arabic by M.S")
-ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.12.0")
+ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.13.0")
 ADDON_DESCRIPTION: str = os.getenv(
     "ADDON_DESCRIPTION",
-    "Arabic subtitles for Stremio. Phase 12 adds episode-aware canonical matching for tt1234567 and tt1234567:1:5 while keeping honest status subtitles until real Arabic is ready.",
+    "Arabic subtitles for Stremio. Phase 13 adds subtitle preview, timing offset adjustments, and preferred record management while keeping exact movie and episode matching.",
 )
 
 # ---------------------------------------------------------------------------

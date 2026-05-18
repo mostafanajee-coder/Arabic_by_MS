@@ -8,6 +8,9 @@ Schema (single table `subtitles`):
     season            INTEGER                      nullable Phase 12 episode season
     episode           INTEGER                      nullable Phase 12 episode number
     canonical_video_key TEXT                       nullable Phase 12 canonical lookup key
+    timing_offset_ms  INTEGER                      nullable Phase 13 latest applied offset
+    user_note         TEXT                         nullable Phase 13 short user note
+    is_preferred      INTEGER                      nullable Phase 13 preferred translated row
     video_type        TEXT NOT NULL DEFAULT 'movie'
     release_name      TEXT
     english_srt_path  TEXT NOT NULL
@@ -43,6 +46,9 @@ CREATE TABLE IF NOT EXISTS subtitles (
     season INTEGER,
     episode INTEGER,
     canonical_video_key TEXT,
+    timing_offset_ms INTEGER,
+    user_note TEXT,
+    is_preferred INTEGER NOT NULL DEFAULT 0,
     video_type TEXT NOT NULL DEFAULT 'movie',
     release_name TEXT,
     english_srt_path TEXT NOT NULL,
@@ -83,6 +89,12 @@ def init_db(db_path: PathLike) -> None:
             conn.execute("ALTER TABLE subtitles ADD COLUMN episode INTEGER")
         if "canonical_video_key" not in columns:
             conn.execute("ALTER TABLE subtitles ADD COLUMN canonical_video_key TEXT")
+        if "timing_offset_ms" not in columns:
+            conn.execute("ALTER TABLE subtitles ADD COLUMN timing_offset_ms INTEGER")
+        if "user_note" not in columns:
+            conn.execute("ALTER TABLE subtitles ADD COLUMN user_note TEXT")
+        if "is_preferred" not in columns:
+            conn.execute("ALTER TABLE subtitles ADD COLUMN is_preferred INTEGER NOT NULL DEFAULT 0")
         if "error_message" not in columns:
             conn.execute("ALTER TABLE subtitles ADD COLUMN error_message TEXT")
         if "source_provider" not in columns:
@@ -101,6 +113,7 @@ def init_db(db_path: PathLike) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_subtitles_canonical_video_key ON subtitles(canonical_video_key)"
         )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_subtitles_preferred ON subtitles(is_preferred)")
         conn.commit()
 
 
@@ -119,6 +132,9 @@ def insert_subtitle(
     season: Optional[int] = None,
     episode: Optional[int] = None,
     canonical_video_key: Optional[str] = None,
+    timing_offset_ms: Optional[int] = None,
+    user_note: Optional[str] = None,
+    is_preferred: int = 0,
     video_type: str,
     release_name: Optional[str],
     english_srt_path: str,
@@ -140,13 +156,14 @@ def insert_subtitle(
             """
             INSERT INTO subtitles (
                 video_id, imdb_id, season, episode, canonical_video_key,
+                timing_offset_ms, user_note, is_preferred,
                 video_type, release_name,
                 english_srt_path, english_srt_hash,
                 arabic_srt_path, status, error_message,
                 source_provider, source_subtitle_id, source_download_url,
                 progress_total_chunks, progress_done_chunks, progress_message,
                 created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 video_id,
@@ -154,6 +171,9 @@ def insert_subtitle(
                 season,
                 episode,
                 canonical_video_key,
+                timing_offset_ms,
+                user_note,
+                int(is_preferred),
                 video_type,
                 release_name,
                 english_srt_path,
@@ -190,6 +210,13 @@ def get_record(db_path: PathLike, record_id: int) -> Optional[Dict[str, Any]]:
             "SELECT * FROM subtitles WHERE id = ?", (record_id,)
         ).fetchone()
     return dict(row) if row else None
+
+
+def get_table_columns(db_path: PathLike) -> List[str]:
+    """Return the current `subtitles` table column names."""
+    with _connect(db_path) as conn:
+        rows = conn.execute("PRAGMA table_info(subtitles)").fetchall()
+    return [str(row[1]) for row in rows]
 
 
 def _lookup_params(
@@ -237,6 +264,10 @@ def find_latest_arabic_for_video(
             ORDER BY
                 CASE
                     WHEN canonical_video_key = ? THEN 0
+                    ELSE 1
+                END,
+                CASE
+                    WHEN is_preferred = 1 THEN 0
                     ELSE 1
                 END,
                 id DESC
@@ -302,8 +333,9 @@ def find_best_record_for_video(
                     ELSE 1
                 END,
                 CASE
-                    WHEN status = 'translated' AND arabic_srt_path IS NOT NULL THEN 0
-                    ELSE 1
+                    WHEN status = 'translated' AND arabic_srt_path IS NOT NULL AND is_preferred = 1 THEN 0
+                    WHEN status = 'translated' AND arabic_srt_path IS NOT NULL THEN 1
+                    ELSE 2
                 END,
                 id DESC
             LIMIT 1
@@ -332,6 +364,81 @@ def set_arabic_srt(
             WHERE id = ?
             """,
             (arabic_srt_path, status, error_message, record_id),
+        )
+        conn.commit()
+
+
+def update_record_media(
+    db_path: PathLike,
+    record_id: int,
+    *,
+    english_srt_path: Optional[str] = None,
+    arabic_srt_path: Optional[str] = None,
+    timing_offset_ms: Optional[int] = None,
+    status: Optional[str] = None,
+    error_message: Optional[str] = None,
+    clear_error_message: bool = False,
+) -> None:
+    """Update one record's media paths and timing metadata."""
+    assignments = []
+    params: List[Any] = []
+    if english_srt_path is not None:
+        assignments.append("english_srt_path = ?")
+        params.append(english_srt_path)
+    if arabic_srt_path is not None:
+        assignments.append("arabic_srt_path = ?")
+        params.append(arabic_srt_path)
+    if timing_offset_ms is not None:
+        assignments.append("timing_offset_ms = ?")
+        params.append(int(timing_offset_ms))
+    if status is not None:
+        assignments.append("status = ?")
+        params.append(status)
+    if error_message is not None or clear_error_message:
+        assignments.append("error_message = ?")
+        params.append(error_message)
+    if not assignments:
+        return
+
+    params.append(record_id)
+    with _connect(db_path) as conn:
+        conn.execute(
+            "UPDATE subtitles SET {0} WHERE id = ?".format(", ".join(assignments)),
+            params,
+        )
+        conn.commit()
+
+
+def set_user_note(db_path: PathLike, record_id: int, user_note: Optional[str]) -> None:
+    """Store a short user note for one subtitle record."""
+    with _connect(db_path) as conn:
+        conn.execute(
+            "UPDATE subtitles SET user_note = ? WHERE id = ?",
+            (user_note, record_id),
+        )
+        conn.commit()
+
+
+def set_preferred_record(
+    db_path: PathLike,
+    record_id: int,
+    *,
+    canonical_video_key: Optional[str],
+    legacy_video_id: str,
+) -> None:
+    """Mark one record as preferred and clear the flag for sibling records."""
+    where_clause, params = _lookup_params(
+        canonical_video_key=canonical_video_key,
+        legacy_video_id=legacy_video_id,
+    )
+    with _connect(db_path) as conn:
+        conn.execute(
+            "UPDATE subtitles SET is_preferred = 0 WHERE {0}".format(where_clause),
+            params,
+        )
+        conn.execute(
+            "UPDATE subtitles SET is_preferred = 1 WHERE id = ?",
+            (record_id,),
         )
         conn.commit()
 

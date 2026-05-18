@@ -7,7 +7,7 @@ import re
 import uuid
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -16,7 +16,17 @@ from . import config
 from .manifest import build_manifest
 from .routes_subtitles import router as subtitles_router
 from services import gemini_service, job_manager, provider_router, subdl_service, subsource_service
-from services.cache_db import delete_record, get_record, init_db, insert_subtitle, list_subtitles
+from services.cache_db import (
+    delete_record,
+    get_record,
+    get_table_columns,
+    init_db,
+    insert_subtitle,
+    list_subtitles,
+    set_preferred_record,
+    set_user_note,
+    update_record_media,
+)
 from services.gemini_service import GeminiError, GeminiNotConfiguredError, get_status as get_gemini_status
 from services.provider_router import PROVIDER_SUBDL, PROVIDER_SUBSOURCE
 from services.subdl_service import SubDLError, SubDLNotConfiguredError
@@ -29,9 +39,11 @@ from services.translation_service import (
 )
 from utils.hash_utils import sha256_text
 from utils.srt_cleaner import TranslationFormatError
+from utils.srt_chunker import SRTParseError, parse_srt
 from utils.srt_quality import SRTQualityError
 from utils.status_srt import build_status_srt
 from utils.stremio_id import parse_stremio_video_id
+from utils.srt_timing import SRTTimingError, shift_srt_content
 from utils.srt_validator import (
     SRTValidationError,
     validate_srt_content,
@@ -257,6 +269,40 @@ _COMPANION_HTML = """<!doctype html>
   </div>
 
   <div id="result"></div>
+
+  <div class="section">
+    <div class="grid">
+      <div>
+        <h2>Subtitle Preview</h2>
+        <div id="preview-result" class="empty">No preview loaded yet.</div>
+      </div>
+      <div>
+        <form id="timing-form">
+          <h2>Adjust Timing</h2>
+          <label for="timing_record_id">Record ID <span style="color:#dc2626">*</span></label>
+          <input id="timing_record_id" name="record_id" required inputmode="numeric" placeholder="1" />
+
+          <label for="timing_offset_ms">Offset ms <span style="color:#dc2626">*</span></label>
+          <input id="timing_offset_ms" name="offset_ms" required inputmode="numeric" placeholder="500 or -500" />
+
+          <label for="timing_target">Target</label>
+          <select id="timing_target" name="target">
+            <option value="arabic" selected>arabic</option>
+            <option value="english">english</option>
+            <option value="both">both</option>
+          </select>
+
+          <div class="check-row">
+            <input id="timing_force" name="force" type="checkbox" />
+            <label for="timing_force" style="margin:0;">Force overwrite current file paths</label>
+          </div>
+
+          <button type="submit" class="primary">Adjust Timing</button>
+        </form>
+        <div id="timing-result"></div>
+      </div>
+    </div>
+  </div>
 
   <div class="section">
     <h2>Uploaded Subtitles</h2>
@@ -627,6 +673,126 @@ _COMPANION_HTML = """<!doctype html>
     }
     window._importSubsourceResult = importSubsourceResult;
 
+    function fillTimingForm(recordId, offsetMs, target) {
+      document.getElementById("timing_record_id").value = String(recordId);
+      document.getElementById("timing_offset_ms").value = String(offsetMs);
+      document.getElementById("timing_target").value = target;
+    }
+    window._fillTimingForm = fillTimingForm;
+
+    async function previewRecord(recordId, lang) {
+      const node = document.getElementById("preview-result");
+      node.className = "";
+      node.innerHTML = "Loading preview...";
+      try {
+        const res = await fetch("/companion/preview/" + recordId + "?lang=" + encodeURIComponent(lang));
+        const data = await res.json();
+        if (!res.ok) {
+          node.className = "msg err";
+          node.textContent = data.detail || "Preview failed";
+          return;
+        }
+        if (!data.available) {
+          node.className = "msg note";
+          node.textContent = "No " + lang + " subtitle file is available for record #" + recordId + ".";
+          return;
+        }
+        const blocks = (data.preview_blocks || []).map(block =>
+          "<tr><td>" + escapeHtml(String(block.index)) + "</td>" +
+          "<td>" + escapeHtml(block.timestamp || "") + "</td>" +
+          "<td><pre style='white-space:pre-wrap;margin:0;'>" + escapeHtml(block.text || "") + "</pre></td></tr>"
+        ).join("");
+        node.innerHTML = "<div class='msg note'>Previewing " + escapeHtml(lang) + " for record #" + escapeHtml(String(recordId)) + ".</div>" +
+          "<table><thead><tr><th>#</th><th>Timestamp</th><th>Text</th></tr></thead><tbody>" + blocks + "</tbody></table>";
+      } catch (err) {
+        node.className = "msg err";
+        node.textContent = err.message;
+      }
+    }
+    window._previewRecord = previewRecord;
+
+    async function setPreferredRecord(recordId, btn) {
+      const msg = document.getElementById("row-msg-" + recordId);
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "Saving...";
+      try {
+        const res = await fetch("/companion/set-preferred/" + recordId, { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) {
+          if (msg) msg.innerHTML = "<span class='msg err'>" + escapeHtml(data.detail || "Set preferred failed") + "</span>";
+          return;
+        }
+        if (msg) msg.innerHTML = "<span class='msg ok'>Preferred record saved.</span>";
+        await refreshList();
+      } catch (err) {
+        if (msg) msg.innerHTML = "<span class='msg err'>" + escapeHtml(err.message) + "</span>";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+    window._setPreferredRecord = setPreferredRecord;
+
+    async function saveRecordNote(recordId, currentNote) {
+      const nextNote = window.prompt("Update note for record #" + recordId, currentNote || "");
+      if (nextNote === null) return;
+      const msg = document.getElementById("row-msg-" + recordId);
+      try {
+        const res = await fetch("/companion/update-note/" + recordId, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_note: nextNote })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          if (msg) msg.innerHTML = "<span class='msg err'>" + escapeHtml(data.detail || "Update note failed") + "</span>";
+          return;
+        }
+        if (msg) msg.innerHTML = "<span class='msg ok'>Note saved.</span>";
+        await refreshList();
+      } catch (err) {
+        if (msg) msg.innerHTML = "<span class='msg err'>" + escapeHtml(err.message) + "</span>";
+      }
+    }
+    window._saveRecordNote = saveRecordNote;
+
+    async function adjustRecordTiming(recordId, offsetMs, target, force, btn) {
+      const msg = document.getElementById("row-msg-" + recordId);
+      fillTimingForm(recordId, offsetMs, target);
+      if (btn) {
+        btn.disabled = true;
+      }
+      try {
+        const res = await fetch("/companion/adjust-timing/" + recordId, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ offset_ms: offsetMs, target: target, force: !!force })
+        });
+        const data = await res.json();
+        const timingResult = document.getElementById("timing-result");
+        if (!res.ok) {
+          const text = data.detail || "Adjust timing failed";
+          if (msg) msg.innerHTML = "<span class='msg err'>" + escapeHtml(text) + "</span>";
+          timingResult.innerHTML = "<div class='msg err'>" + escapeHtml(text) + "</div>";
+          return;
+        }
+        const summary = "Adjusted " + (data.adjusted_targets || []).join(", ") +
+          " by " + String(data.offset_ms) + "ms.";
+        if (msg) msg.innerHTML = "<span class='msg ok'>" + escapeHtml(summary) + "</span>";
+        timingResult.innerHTML = "<div class='msg ok'>" + escapeHtml(summary) + "</div>";
+        await refreshList();
+      } catch (err) {
+        if (msg) msg.innerHTML = "<span class='msg err'>" + escapeHtml(err.message) + "</span>";
+        document.getElementById("timing-result").innerHTML = "<div class='msg err'>" + escapeHtml(err.message) + "</div>";
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+        }
+      }
+    }
+    window._adjustRecordTiming = adjustRecordTiming;
+
     function renderProviderResults(nodeId, items, importFnName, emptyText) {
       const node = document.getElementById(nodeId);
       if (!items || items.length === 0) {
@@ -720,15 +886,24 @@ _COMPANION_HTML = """<!doctype html>
             action += "<button onclick='_translateRecord(" + r.id + ", this, true)'>Force Retranslate</button>" +
               "<button onclick='_translateBackground(" + r.id + ", this, true)'>Force Background Retranslate</button>";
           }
+          action += "<button onclick='_previewRecord(" + r.id + ", \"english\")'>Preview English</button>";
+          action += "<button onclick='_previewRecord(" + r.id + ", \"arabic\")'>Preview Arabic</button>";
+          action += "<button onclick='_setPreferredRecord(" + r.id + ", this)'>Set Preferred</button>";
+          action += "<button onclick='_adjustRecordTiming(" + r.id + ", 500, \"arabic\", false, this)'>Adjust Arabic +500ms</button>";
+          action += "<button onclick='_adjustRecordTiming(" + r.id + ", -500, \"arabic\", false, this)'>Adjust Arabic -500ms</button>";
+          action += "<button onclick='_saveRecordNote(" + r.id + ", " + JSON.stringify(r.user_note || "") + ")'>Update Note</button>";
           return `
             <tr>
               <td>${r.id}</td>
               <td>${escapeHtml(r.video_id)}</td>
               <td>${escapeHtml(r.canonical_video_key || "")}</td>
               <td>${escapeHtml(r.imdb_id || "")}</td>
+              <td>${r.is_preferred ? "<span class='badge done'>preferred</span>" : ""}</td>
               <td>${escapeHtml(r.video_type)}</td>
               <td>${escapeHtml(r.season ?? "")}</td>
               <td>${escapeHtml(r.episode ?? "")}</td>
+              <td>${escapeHtml(r.timing_offset_ms ?? "")}</td>
+              <td>${escapeHtml(r.user_note || "")}</td>
               <td>${escapeHtml(r.release_name || "")}</td>
               <td>${escapeHtml(r.source_provider || "")}</td>
               <td><span class="badge ${badgeClass}">${escapeHtml(r.status)}</span></td>
@@ -741,7 +916,7 @@ _COMPANION_HTML = """<!doctype html>
         list.className = "";
         list.innerHTML = `<table>
           <thead><tr>
-            <th>#</th><th>Video ID</th><th>Canonical</th><th>IMDb</th><th>Type</th><th>Season</th><th>Episode</th><th>Release</th><th>Source</th>
+            <th>#</th><th>Video ID</th><th>Canonical</th><th>IMDb</th><th>Preferred</th><th>Type</th><th>Season</th><th>Episode</th><th>Offset ms</th><th>Note</th><th>Release</th><th>Source</th>
             <th>Status</th><th>Error</th><th>Progress</th><th>Action</th><th>Created (UTC)</th>
           </tr></thead>
           <tbody>${rows}</tbody>
@@ -889,6 +1064,15 @@ _COMPANION_HTML = """<!doctype html>
       }
     });
 
+    document.getElementById("timing-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const recordId = document.getElementById("timing_record_id").value;
+      const offsetMs = document.getElementById("timing_offset_ms").value;
+      const target = document.getElementById("timing_target").value;
+      const force = document.getElementById("timing_force").checked;
+      await adjustRecordTiming(Number(recordId), Number(offsetMs), target, force, null);
+    });
+
     refreshInstallInfo();
     refreshHealth();
     refreshProviderStatus();
@@ -1025,6 +1209,9 @@ def _store_english_srt_record(
         "english_srt_path": str(target),
         "english_srt_hash": english_hash,
         "arabic_srt_path": None,
+        "timing_offset_ms": None,
+        "user_note": None,
+        "is_preferred": 0,
         "status": "uploaded",
         "error_message": None,
         "source_provider": normalized_source_provider,
@@ -1112,6 +1299,154 @@ def _parse_bool(value: Any, *, default: bool) -> bool:
     if text in ("0", "false", "no", "off"):
         return False
     raise HTTPException(status_code=400, detail="Invalid boolean value")
+
+
+def _parse_lang(value: Any, *, default: str = "english") -> str:
+    text = str(value or default).strip().lower() or default
+    if text not in ("english", "arabic"):
+        raise HTTPException(status_code=400, detail="lang must be english or arabic")
+    return text
+
+
+def _parse_target(value: Any, *, default: str = "arabic") -> str:
+    text = str(value or default).strip().lower() or default
+    if text not in ("english", "arabic", "both"):
+        raise HTTPException(status_code=400, detail="target must be english, arabic, or both")
+    return text
+
+
+def _parse_limit(value: Any, *, default: int = 20) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        limit = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="limit must be a positive integer") from exc
+    if limit <= 0:
+        raise HTTPException(status_code=400, detail="limit must be a positive integer")
+    return limit
+
+
+def _parse_offset_ms(value: Any) -> int:
+    try:
+        return int(str(value).strip())
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="offset_ms is required and must be an integer") from exc
+
+
+def _parse_adjust_timing_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "offset_ms": _parse_offset_ms(payload.get("offset_ms")),
+        "target": _parse_target(payload.get("target"), default="arabic"),
+        "force": _parse_bool(payload.get("force"), default=False),
+    }
+
+
+def _normalize_user_note(value: Any) -> Optional[str]:
+    note = _parse_optional_text(value)
+    if note is None:
+        return None
+    if len(note) > 200:
+        raise HTTPException(status_code=400, detail="user_note must be 200 characters or fewer")
+    return note
+
+
+def _record_file_path(record: Dict[str, Any], lang: str) -> Optional[Path]:
+    field = "arabic_srt_path" if lang == "arabic" else "english_srt_path"
+    value = _parse_optional_text(record.get(field))
+    return Path(value) if value else None
+
+
+def _load_srt_entries(path: Path) -> List[Dict[str, Any]]:
+    try:
+        text = path.read_text(encoding="utf-8")
+        entries = parse_srt(text)
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="Subtitle file is missing on disk") from exc
+    except SRTParseError as exc:
+        raise HTTPException(status_code=400, detail="Stored subtitle file is invalid SRT") from exc
+    return [
+        {
+            "index": entry.index,
+            "timestamp": entry.timestamp,
+            "text": entry.text,
+        }
+        for entry in entries
+    ]
+
+
+def _preview_record(record: Dict[str, Any], *, lang: str, limit: int) -> Dict[str, Any]:
+    path = _record_file_path(record, lang)
+    if not path or not path.exists():
+        return {
+            "record_id": int(record["id"]),
+            "lang": lang,
+            "available": False,
+            "preview_blocks": [],
+        }
+    return {
+        "record_id": int(record["id"]),
+        "lang": lang,
+        "available": True,
+        "preview_blocks": _load_srt_entries(path)[:limit],
+    }
+
+
+def _unique_variant_path(path: Path, suffix_tag: str) -> Path:
+    candidate = path.with_name("{0}.{1}{2}".format(path.stem, suffix_tag, path.suffix))
+    if not candidate.exists():
+        return candidate
+    for counter in range(2, 1000):
+        candidate = path.with_name(
+            "{0}.{1}.{2}{3}".format(path.stem, suffix_tag, counter, path.suffix)
+        )
+        if not candidate.exists():
+            return candidate
+    raise HTTPException(status_code=500, detail="Could not allocate a safe subtitle filename")
+
+
+def _adjust_file_path(path: Path, *, offset_ms: int, force: bool) -> Path:
+    if force:
+        return path
+    sign = "plus" if offset_ms >= 0 else "minus"
+    return _unique_variant_path(path, "{0}{1}ms".format(sign, abs(offset_ms)))
+
+
+def _backup_existing_file(path: Path) -> Optional[Path]:
+    if not path.exists():
+        return None
+    backup_path = _unique_variant_path(path, "bak")
+    backup_path.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    return backup_path
+
+
+def _write_shifted_srt(path: Path, *, offset_ms: int, force: bool) -> Dict[str, Any]:
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Subtitle file is missing on disk")
+    try:
+        original_text = path.read_text(encoding="utf-8")
+        shifted_text = shift_srt_content(original_text, offset_ms)
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail="Subtitle file is missing on disk") from exc
+    except SRTTimingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    destination = _adjust_file_path(path, offset_ms=offset_ms, force=force)
+    backup_path = _backup_existing_file(path) if force else None
+    destination.write_text(shifted_text, encoding="utf-8")
+    return {
+        "path": str(destination),
+        "backup_path": str(backup_path) if backup_path else None,
+    }
+
+
+def _record_has_translated_arabic(record: Dict[str, Any]) -> bool:
+    arabic_path = _record_file_path(record, "arabic")
+    return bool(
+        record.get("status") == "translated"
+        and arabic_path
+        and arabic_path.exists()
+    )
 
 
 def _import_provider_item(
@@ -1304,6 +1639,142 @@ def translation_status(record_id: int) -> Dict[str, Any]:
     }
 
 
+@router.get("/companion/preview/{record_id}")
+def preview_record(
+    record_id: int,
+    lang: str = Query("english"),
+    limit: int = Query(20),
+) -> Dict[str, Any]:
+    """Preview the first subtitle cues for one record and language."""
+    record = get_record(config.DB_PATH, record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"No subtitle record with id={record_id}")
+    return _preview_record(
+        record,
+        lang=_parse_lang(lang),
+        limit=_parse_limit(limit),
+    )
+
+
+@router.post("/companion/update-note/{record_id}")
+async def update_note(record_id: int, request: Request) -> JSONResponse:
+    """Store a short user note for one subtitle record."""
+    record = get_record(config.DB_PATH, record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"No subtitle record with id={record_id}")
+
+    payload = await _read_request_payload(request)
+    user_note = _normalize_user_note(payload.get("user_note"))
+    set_user_note(config.DB_PATH, record_id, user_note)
+    updated = get_record(config.DB_PATH, record_id) or record
+    return JSONResponse(
+        {
+            "record_id": record_id,
+            "user_note": updated.get("user_note"),
+        }
+    )
+
+
+@router.post("/companion/adjust-timing/{record_id}")
+async def adjust_timing(record_id: int, request: Request) -> JSONResponse:
+    """Adjust English and/or Arabic subtitle timing for one record."""
+    record = get_record(config.DB_PATH, record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"No subtitle record with id={record_id}")
+
+    payload = _parse_adjust_timing_payload(await _read_request_payload(request))
+    offset_ms = int(payload["offset_ms"])
+    target = str(payload["target"])
+    force = bool(payload["force"])
+
+    english_path = _record_file_path(record, "english")
+    arabic_path = _record_file_path(record, "arabic")
+    has_arabic = bool(arabic_path and arabic_path.exists())
+
+    if target == "arabic" and not has_arabic:
+        raise HTTPException(status_code=400, detail="Arabic subtitle is not available for this record")
+
+    updates: Dict[str, Any] = {}
+    adjusted_targets: List[str] = []
+    backup_paths: Dict[str, str] = {}
+
+    if target in ("english", "both"):
+        if not english_path or not english_path.exists():
+            raise HTTPException(status_code=404, detail="English subtitle file is missing on disk")
+        english_result = _write_shifted_srt(english_path, offset_ms=offset_ms, force=force)
+        updates["english_srt_path"] = english_result["path"]
+        adjusted_targets.append("english")
+        if english_result["backup_path"]:
+            backup_paths["english"] = str(english_result["backup_path"])
+
+    if target in ("arabic", "both") and has_arabic and arabic_path:
+        arabic_result = _write_shifted_srt(arabic_path, offset_ms=offset_ms, force=force)
+        updates["arabic_srt_path"] = arabic_result["path"]
+        adjusted_targets.append("arabic")
+        if arabic_result["backup_path"]:
+            backup_paths["arabic"] = str(arabic_result["backup_path"])
+
+    current_offset = int(record.get("timing_offset_ms") or 0)
+    updates["timing_offset_ms"] = current_offset + offset_ms
+    if not has_arabic:
+        updates["status"] = "uploaded"
+        updates["error_message"] = None
+
+    update_record_media(
+        config.DB_PATH,
+        record_id,
+        english_srt_path=updates.get("english_srt_path"),
+        arabic_srt_path=updates.get("arabic_srt_path"),
+        timing_offset_ms=updates.get("timing_offset_ms"),
+        status=updates.get("status"),
+        error_message=updates.get("error_message"),
+        clear_error_message="status" in updates,
+    )
+    updated = get_record(config.DB_PATH, record_id) or record
+    return JSONResponse(
+        {
+            "record_id": record_id,
+            "offset_ms": offset_ms,
+            "target": target,
+            "force": force,
+            "adjusted_targets": adjusted_targets,
+            "backup_paths": backup_paths,
+            "english_srt_path": updated.get("english_srt_path"),
+            "arabic_srt_path": updated.get("arabic_srt_path"),
+            "timing_offset_ms": updated.get("timing_offset_ms"),
+            "status": updated.get("status"),
+        }
+    )
+
+
+@router.post("/companion/set-preferred/{record_id}")
+def set_preferred(record_id: int) -> JSONResponse:
+    """Mark one translated Arabic record as preferred for its canonical key."""
+    record = get_record(config.DB_PATH, record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"No subtitle record with id={record_id}")
+    if not _record_has_translated_arabic(record):
+        raise HTTPException(
+            status_code=400,
+            detail="Only translated records with a real Arabic subtitle can be preferred",
+        )
+
+    set_preferred_record(
+        config.DB_PATH,
+        record_id,
+        canonical_video_key=_parse_optional_text(record.get("canonical_video_key")),
+        legacy_video_id=str(record.get("video_id") or ""),
+    )
+    updated = get_record(config.DB_PATH, record_id) or record
+    return JSONResponse(
+        {
+            "record_id": record_id,
+            "canonical_video_key": updated.get("canonical_video_key"),
+            "is_preferred": bool(updated.get("is_preferred")),
+        }
+    )
+
+
 @router.post("/companion/translate-background/{record_id}")
 def translate_background(record_id: int, force: bool = Query(False)) -> JSONResponse:
     """Start a background translation job and return immediately."""
@@ -1359,6 +1830,22 @@ def diagnostics() -> Dict[str, Any]:
         )
     except Exception:
         stremio_id_parser_ready = False
+    try:
+        shifted = shift_srt_content(
+            "1\n00:00:01,000 --> 00:00:02,000\nTest\n",
+            500,
+        )
+        srt_timing_ready = "00:00:01,500 --> 00:00:02,500" in shifted
+    except Exception:
+        srt_timing_ready = False
+    try:
+        columns = set(get_table_columns(config.DB_PATH))
+        preferred_record_ready = all(
+            column in columns
+            for column in ("timing_offset_ms", "user_note", "is_preferred")
+        )
+    except Exception:
+        preferred_record_ready = False
     return {
         "python_app_import_ok": python_app_import_ok,
         "cache_db_ready": _cache_db_ready(),
@@ -1374,6 +1861,8 @@ def diagnostics() -> Dict[str, Any]:
         "job_manager_ready": job_manager.is_ready(),
         "status_subtitle_ready": status_subtitle_ready,
         "stremio_id_parser_ready": stremio_id_parser_ready,
+        "srt_timing_ready": srt_timing_ready,
+        "preferred_record_ready": preferred_record_ready,
     }
 
 

@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS batch_prepare_items (
     quality_level TEXT,
     quality_warnings TEXT,
     reject_hint INTEGER NOT NULL DEFAULT 0,
+    local_first_reused INTEGER NOT NULL DEFAULT 0,
+    local_reuse_reason TEXT,
     error_message TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -125,6 +127,8 @@ def init_db(db_path: PathLike) -> None:
                 "quality_level": "TEXT",
                 "quality_warnings": "TEXT",
                 "reject_hint": "INTEGER NOT NULL DEFAULT 0",
+                "local_first_reused": "INTEGER NOT NULL DEFAULT 0",
+                "local_reuse_reason": "TEXT",
                 "error_message": "TEXT",
                 "created_at": "TEXT",
                 "updated_at": "TEXT",
@@ -185,6 +189,7 @@ def request_batch_prepare(
     query: Optional[str],
     release_name: Optional[str],
     force: bool,
+    force_provider_search: bool,
     max_items: int,
     db_path: PathLike,
     english_cache_dir: PathLike,
@@ -248,6 +253,8 @@ def request_batch_prepare(
                 "quality_level": None,
                 "quality_warnings": [],
                 "reject_hint": False,
+                "local_first_reused": False,
+                "local_reuse_reason": None,
                 "error_message": None,
                 "created_at": created_at,
                 "updated_at": created_at,
@@ -301,8 +308,9 @@ def request_batch_prepare(
             INSERT INTO batch_prepare_items (
                 batch_id, canonical_video_key, video_id, season, episode, status,
                 record_id, job_id, provider, score, quality_score, quality_level,
-                quality_warnings, reject_hint, error_message, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                quality_warnings, reject_hint, local_first_reused, local_reuse_reason,
+                error_message, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -320,6 +328,8 @@ def request_batch_prepare(
                     item["quality_level"],
                     json.dumps(item["quality_warnings"]),
                     int(bool(item["reject_hint"])),
+                    int(bool(item["local_first_reused"])),
+                    item["local_reuse_reason"],
                     item["error_message"],
                     item["created_at"],
                     item["updated_at"],
@@ -336,6 +346,7 @@ def request_batch_prepare(
             english_cache_dir=english_cache_dir,
             arabic_cache_dir=arabic_cache_dir,
             force=force,
+            force_provider_search=force_provider_search,
         )
     return get_batch_status(batch_id, db_path)
 
@@ -377,6 +388,8 @@ def get_batch_status(batch_id: str, db_path: PathLike) -> Optional[Dict[str, Any
                 "quality_level": item["quality_level"],
                 "quality_warnings": _decode_quality_warnings(item.get("quality_warnings")),
                 "reject_hint": bool(item.get("reject_hint")),
+                "local_first_reused": bool(item.get("local_first_reused")),
+                "local_reuse_reason": item.get("local_reuse_reason"),
                 "error_message": item["error_message"],
             }
             for item in items
@@ -511,6 +524,7 @@ def _start_worker(
     english_cache_dir: PathLike,
     arabic_cache_dir: PathLike,
     force: bool,
+    force_provider_search: bool,
 ) -> None:
     def worker() -> None:
         _run_batch(
@@ -519,6 +533,7 @@ def _start_worker(
             english_cache_dir=english_cache_dir,
             arabic_cache_dir=arabic_cache_dir,
             force=force,
+            force_provider_search=force_provider_search,
         )
 
     thread = threading.Thread(
@@ -538,6 +553,7 @@ def _run_batch(
     english_cache_dir: PathLike,
     arabic_cache_dir: PathLike,
     force: bool,
+    force_provider_search: bool,
 ) -> None:
     _update_job_status(db_path, batch_id, status=STATUS_RUNNING, error_message=None)
     try:
@@ -567,6 +583,7 @@ def _run_batch(
                     release_name=job.get("release_name"),
                     language="en",
                     force=force,
+                    force_provider_search=force_provider_search,
                     db_path=db_path,
                     english_cache_dir=english_cache_dir,
                     arabic_cache_dir=arabic_cache_dir,
@@ -604,6 +621,8 @@ def _apply_prepare_result(db_path: PathLike, item_id: int, result: Dict[str, Any
             quality_level=result.get("quality_level"),
             quality_warnings=result.get("quality_warnings"),
             reject_hint=result.get("reject_hint"),
+            local_first_reused=result.get("local_first_reused"),
+            local_reuse_reason=result.get("local_reuse_reason"),
             error_message=None,
         )
         return
@@ -620,6 +639,8 @@ def _apply_prepare_result(db_path: PathLike, item_id: int, result: Dict[str, Any
             quality_level=result.get("quality_level"),
             quality_warnings=result.get("quality_warnings"),
             reject_hint=result.get("reject_hint"),
+            local_first_reused=result.get("local_first_reused"),
+            local_reuse_reason=result.get("local_reuse_reason"),
             error_message=None,
         )
         return
@@ -635,6 +656,8 @@ def _apply_prepare_result(db_path: PathLike, item_id: int, result: Dict[str, Any
         quality_level=result.get("quality_level"),
         quality_warnings=result.get("quality_warnings"),
         reject_hint=result.get("reject_hint"),
+        local_first_reused=result.get("local_first_reused"),
+        local_reuse_reason=result.get("local_reuse_reason"),
         error_message=str(result.get("message") or status or "Batch prepare item failed."),
     )
 
@@ -671,6 +694,8 @@ def _update_item(
     quality_level: Optional[Any] = None,
     quality_warnings: Optional[Any] = None,
     reject_hint: Optional[Any] = None,
+    local_first_reused: Optional[Any] = None,
+    local_reuse_reason: Optional[str] = None,
     error_message: Optional[str] = None,
 ) -> None:
     with _connect(db_path) as conn:
@@ -686,6 +711,8 @@ def _update_item(
                 quality_level = ?,
                 quality_warnings = ?,
                 reject_hint = ?,
+                local_first_reused = ?,
+                local_reuse_reason = ?,
                 error_message = ?,
                 updated_at = ?
             WHERE id = ?
@@ -700,6 +727,8 @@ def _update_item(
                 _normalize_text(quality_level),
                 json.dumps(list(quality_warnings or [])),
                 int(bool(reject_hint)),
+                int(bool(local_first_reused)),
+                _normalize_text(local_reuse_reason),
                 _normalize_text(error_message),
                 _utcnow_iso(),
                 item_id,

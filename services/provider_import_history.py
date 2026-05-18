@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 from services import cache_db
 from utils.hash_utils import sha256_text
@@ -61,6 +61,12 @@ def init_db(db_path: PathLike) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_provider_import_history_last_imported_at
             ON provider_import_history(last_imported_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_provider_import_history_video_lookup
+            ON provider_import_history(video_identity, season, episode, last_imported_at DESC)
             """
         )
         conn.commit()
@@ -279,6 +285,88 @@ def clear_entries(db_path: PathLike) -> int:
     return count
 
 
+def find_best_existing_import_for_video(
+    db_path: PathLike,
+    *,
+    video_identity: Optional[str],
+    legacy_video_id: Optional[str],
+    canonical_video_key: Optional[str],
+    season: Optional[int],
+    episode: Optional[int],
+    allow_bad_quality: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Return the best locally imported subtitle for one video identity."""
+    identities = _video_identity_candidates(
+        video_identity=video_identity,
+        legacy_video_id=legacy_video_id,
+        canonical_video_key=canonical_video_key,
+    )
+    if not identities:
+        return None
+
+    rows = _find_history_rows_for_video(
+        db_path,
+        identities=identities,
+        season=season,
+        episode=episode,
+    )
+    if not rows:
+        return None
+
+    records = cache_db.list_records_for_video(
+        db_path,
+        str(legacy_video_id or video_identity or canonical_video_key or "").strip(),
+        canonical_video_key=canonical_video_key,
+    )
+    records_by_id = {
+        int(record["id"]): record
+        for record in records
+        if record.get("id") is not None
+    }
+
+    candidates: List[Dict[str, Any]] = []
+    for row in rows:
+        record_id = int(row.get("record_id") or 0)
+        record = records_by_id.get(record_id) or cache_db.get_record(db_path, record_id)
+        if not record:
+            continue
+        summary = {
+            "provider": _normalize_text(row.get("provider")),
+            "subtitle_id": _normalize_text(row.get("subtitle_id")),
+            "release_name": _normalize_text(row.get("release_name")),
+            "video_identity": _normalize_text(row.get("video_identity")),
+            "season": row.get("season"),
+            "episode": row.get("episode"),
+            "record_id": record_id,
+            "record_status": record.get("status"),
+            "record_has_arabic": bool(record.get("arabic_srt_path")),
+            "import_count": int(row.get("import_count") or 0),
+            "first_imported_at": row.get("first_imported_at"),
+            "last_imported_at": row.get("last_imported_at"),
+            "quality_level": _normalize_text(row.get("quality_level")),
+            "quality_score": row.get("quality_score"),
+        }
+        if not allow_bad_quality and _quality_bucket(summary.get("quality_level")) <= 0:
+            continue
+        candidates.append(summary)
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda item: (
+            _quality_bucket(item.get("quality_level")),
+            _translated_bucket(item.get("record_status"), item.get("record_has_arabic")),
+            int(item.get("quality_score") or 0),
+            int(item.get("import_count") or 0),
+            str(item.get("last_imported_at") or ""),
+            int(item.get("record_id") or 0),
+        ),
+        reverse=True,
+    )
+    return dict(candidates[0])
+
+
 def _find_matching_record(
     db_path: PathLike,
     *,
@@ -313,6 +401,32 @@ def _find_matching_record(
     return None
 
 
+def _find_history_rows_for_video(
+    db_path: PathLike,
+    *,
+    identities: Iterable[str],
+    season: Optional[int],
+    episode: Optional[int],
+) -> List[Dict[str, Any]]:
+    identity_list = [str(item).strip() for item in identities if str(item).strip()]
+    if not identity_list:
+        return []
+    placeholders = ", ".join("?" for _ in identity_list)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM provider_import_history
+            WHERE video_identity IN ({0})
+              AND season IS ?
+              AND episode IS ?
+            ORDER BY last_imported_at DESC, import_count DESC, id DESC
+            """.format(placeholders),
+            (*identity_list, season, episode),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def _connect(db_path: PathLike) -> sqlite3.Connection:
     init_db(db_path)
     conn = sqlite3.connect(str(db_path))
@@ -339,6 +453,44 @@ def _history_key(
         "season": season,
         "episode": episode,
     }
+
+
+def _video_identity_candidates(
+    *,
+    video_identity: Optional[str],
+    legacy_video_id: Optional[str],
+    canonical_video_key: Optional[str],
+) -> List[str]:
+    seen = set()
+    values: List[str] = []
+    for raw in (video_identity, canonical_video_key, legacy_video_id):
+        value = str(raw or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            values.append(value)
+    return values
+
+
+def _quality_bucket(level: Optional[str]) -> int:
+    normalized = str(level or "").strip().lower()
+    if normalized == "good":
+        return 3
+    if normalized == "warning":
+        return 2
+    if not normalized:
+        return 2
+    if normalized == "bad":
+        return 0
+    return 1
+
+
+def _translated_bucket(status: Optional[str], has_arabic: bool) -> int:
+    normalized = str(status or "").strip().lower()
+    if normalized == "translated" and has_arabic:
+        return 2
+    if has_arabic:
+        return 1
+    return 0
 
 
 def _build_summary(

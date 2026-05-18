@@ -17,6 +17,7 @@ Phase 20: adds subtitle quality inspection and safe import warnings.
 Phase 21: adds quality-aware import-best fallback across ranked candidates.
 Phase 22: adds provider candidate quarantine memory and safe future deprioritization.
 Phase 23: adds provider subtitle import history and duplicate-import prevention.
+Phase 24: adds local-first subtitle reuse before provider search when safe.
 """
 
 from __future__ import annotations
@@ -65,10 +66,10 @@ DB_PATH: Path = CACHE_DIR / "subtitles.db"
 
 ADDON_ID: str = os.getenv("ADDON_ID", "community.arabic.by.ms")
 ADDON_NAME: str = os.getenv("ADDON_NAME", "Arabic by M.S")
-ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.23.0")
+ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.24.0")
 ADDON_DESCRIPTION: str = os.getenv(
     "ADDON_DESCRIPTION",
-    "Arabic subtitles for Stremio. Phase 23 keeps the Phase 22 quarantine memory, Phase 21 quality-aware fallback, Phase 20 subtitle quality inspection, Phase 19 match intelligence, Phase 18 provider reliability, and Phase 17 OpenSubtitles behavior, and adds provider subtitle import history with duplicate-import prevention.",
+    "Arabic subtitles for Stremio. Phase 24 keeps the Phase 23 import history, Phase 22 quarantine memory, Phase 21 quality-aware fallback, Phase 20 subtitle quality inspection, Phase 19 match intelligence, Phase 18 provider reliability, and Phase 17 OpenSubtitles behavior, and adds local-first subtitle reuse before provider search when safe.",
 )
 
 # ---------------------------------------------------------------------------

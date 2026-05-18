@@ -107,6 +107,8 @@ def test_batch_tables_creation_and_migration(tmp_path: Path) -> None:
         "quality_level",
         "quality_warnings",
         "reject_hint",
+        "local_first_reused",
+        "local_reuse_reason",
         "error_message",
         "created_at",
         "updated_at",

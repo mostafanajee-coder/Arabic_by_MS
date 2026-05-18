@@ -61,6 +61,7 @@ def request_prepare(
     release_name: Optional[str] = None,
     language: str = "en",
     force: bool = False,
+    force_provider_search: bool = False,
     db_path: PathLike,
     english_cache_dir: PathLike,
     arabic_cache_dir: PathLike,
@@ -147,12 +148,94 @@ def request_prepare(
             message="Preparation is already in progress for this exact title.",
         )
 
+    local_candidate = None
+    if not force_provider_search:
+        local_candidate = provider_import_history.find_best_existing_import_for_video(
+            db_path,
+            video_identity=canonical_video_key or normalized_video_id,
+            legacy_video_id=normalized_video_id,
+            canonical_video_key=canonical_video_key,
+            season=identity.get("season"),
+            episode=identity.get("episode"),
+            allow_bad_quality=False,
+        )
+
+    gemini_status = get_gemini_status()
+    if local_candidate:
+        if not gemini_status.get("configured"):
+            return _result(
+                status="gemini_missing",
+                canonical_video_key=canonical_video_key,
+                record_id=None,
+                job_id=None,
+                provider=None,
+                score=None,
+                message=str(gemini_status.get("message") or "Gemini is not configured."),
+            )
+        return _start_prepare_from_local_candidate(
+            db_path=db_path,
+            video_id=normalized_video_id,
+            canonical_video_key=canonical_video_key,
+            season=identity.get("season"),
+            episode=identity.get("episode"),
+            force=force,
+            arabic_cache_dir=arabic_cache_dir,
+            local_candidate=local_candidate,
+            request_source=request_source,
+            local_first_reused=True,
+            local_reuse_reason=_local_reuse_reason(local_candidate),
+        )
+
     provider_status = provider_router.get_provider_status()
     provider_ready = any(
         bool(provider_status.get(name, {}).get("configured"))
         for name in ("subdl", "subsource", "opensubtitles")
     )
     if not provider_ready:
+        if not force_provider_search:
+            local_bad_candidate = provider_import_history.find_best_existing_import_for_video(
+                db_path,
+                video_identity=canonical_video_key or normalized_video_id,
+                legacy_video_id=normalized_video_id,
+                canonical_video_key=canonical_video_key,
+                season=identity.get("season"),
+                episode=identity.get("episode"),
+                allow_bad_quality=True,
+            )
+            if (
+                local_bad_candidate
+                and _normalize_optional_text(local_bad_candidate.get("quality_level")) == "bad"
+            ):
+                if not gemini_status.get("configured"):
+                    return _result(
+                        status="gemini_missing",
+                        canonical_video_key=canonical_video_key,
+                        record_id=None,
+                        job_id=None,
+                        provider=None,
+                        score=None,
+                        message=str(gemini_status.get("message") or "Gemini is not configured."),
+                    )
+                return _start_prepare_from_local_candidate(
+                    db_path=db_path,
+                    video_id=normalized_video_id,
+                    canonical_video_key=canonical_video_key,
+                    season=identity.get("season"),
+                    episode=identity.get("episode"),
+                    force=force,
+                    arabic_cache_dir=arabic_cache_dir,
+                    local_candidate=local_bad_candidate,
+                    request_source=request_source,
+                    local_first_reused=True,
+                    local_reuse_reason=_local_reuse_reason(
+                        local_bad_candidate,
+                        fallback_from_bad_quality=True,
+                    ),
+                    fallback_reason=_local_reuse_reason(
+                        local_bad_candidate,
+                        fallback_from_bad_quality=True,
+                    ),
+                )
         return _result(
             status="provider_missing",
             canonical_video_key=canonical_video_key,
@@ -163,7 +246,6 @@ def request_prepare(
             message="No subtitle provider is configured. Add SubDL, SubSource, and/or OpenSubtitles first.",
         )
 
-    gemini_status = get_gemini_status()
     if not gemini_status.get("configured"):
         return _result(
             status="gemini_missing",
@@ -216,6 +298,7 @@ def request_prepare(
             release_name=normalized_release_name,
             language=normalized_language,
             force=force,
+            force_provider_search=force_provider_search,
             db_path=db_path,
             english_cache_dir=english_cache_dir,
             arabic_cache_dir=arabic_cache_dir,
@@ -232,6 +315,7 @@ def request_prepare(
         release_name=normalized_release_name,
         language=normalized_language,
         force=force,
+        force_provider_search=force_provider_search,
         db_path=db_path,
         english_cache_dir=english_cache_dir,
         arabic_cache_dir=arabic_cache_dir,
@@ -384,11 +468,26 @@ def _perform_prepare(
     release_name: Optional[str],
     language: str,
     force: bool,
+    force_provider_search: bool,
     db_path: PathLike,
     english_cache_dir: PathLike,
     arabic_cache_dir: PathLike,
     request_source: str,
 ) -> Dict[str, Any]:
+    local_bad_candidate = None
+    if not force_provider_search:
+        local_bad_candidate = provider_import_history.find_best_existing_import_for_video(
+            db_path,
+            video_identity=canonical_video_key or video_id,
+            legacy_video_id=video_id,
+            canonical_video_key=canonical_video_key,
+            season=season,
+            episode=episode,
+            allow_bad_quality=True,
+        )
+        if _normalize_optional_text((local_bad_candidate or {}).get("quality_level")) != "bad":
+            local_bad_candidate = None
+
     usage_guard.record_event(
         db_path,
         event_type=usage_guard.EVENT_PROVIDER_SEARCH,
@@ -407,6 +506,27 @@ def _perform_prepare(
     )
     items = search_result.get("items") or []
     if not items:
+        if local_bad_candidate:
+            return _start_prepare_from_local_candidate(
+                db_path=db_path,
+                video_id=video_id,
+                canonical_video_key=canonical_video_key,
+                season=season,
+                episode=episode,
+                force=force,
+                arabic_cache_dir=arabic_cache_dir,
+                local_candidate=local_bad_candidate,
+                request_source=request_source,
+                local_first_reused=False,
+                local_reuse_reason=_local_reuse_reason(
+                    local_bad_candidate,
+                    fallback_from_bad_quality=True,
+                ),
+                fallback_reason=_local_reuse_reason(
+                    local_bad_candidate,
+                    fallback_from_bad_quality=True,
+                ),
+            )
         provider_error_summary = provider_router.summarize_provider_errors(
             search_result.get("provider_errors") or {}
         )
@@ -538,6 +658,8 @@ def _perform_prepare(
     result["import_history"] = imported.get("import_history") or selection.get("selected_import_history")
     result["reused_existing_record"] = bool(imported.get("reused_existing_record"))
     result["import_history_note"] = selection.get("import_history_note")
+    result["local_first_reused"] = False
+    result["local_reuse_reason"] = None
     if selection.get("fallback_reason"):
         result["message"] += " " + str(selection["fallback_reason"])
     if inspected.get("quality_level") == "bad" and inspected.get("quality_message"):
@@ -767,6 +889,8 @@ def _result(
         "provider": provider,
         "score": score,
         "message": message,
+        "local_first_reused": False,
+        "local_reuse_reason": None,
     }
     if quality_metadata:
         result.update(
@@ -789,6 +913,126 @@ def _result(
             }
         )
     return result
+
+
+def _start_prepare_from_local_candidate(
+    *,
+    db_path: PathLike,
+    video_id: str,
+    canonical_video_key: str,
+    season: Optional[int],
+    episode: Optional[int],
+    force: bool,
+    arabic_cache_dir: PathLike,
+    local_candidate: Dict[str, Any],
+    request_source: str,
+    local_first_reused: bool,
+    local_reuse_reason: str,
+    fallback_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    record_id = int(local_candidate["record_id"])
+    existing_record = cache_db.get_record(db_path, record_id)
+    if not existing_record:
+        return _result(
+            status="no_results",
+            canonical_video_key=canonical_video_key,
+            record_id=None,
+            job_id=None,
+            provider=None,
+            score=None,
+            message="A cached local subtitle was remembered, but its record is no longer available.",
+        )
+    updated_history = provider_import_history.record_import(
+        db_path,
+        provider=local_candidate.get("provider"),
+        subtitle_id=local_candidate.get("subtitle_id"),
+        download_url=existing_record.get("source_download_url"),
+        release_name=local_candidate.get("release_name"),
+        video_identity=canonical_video_key or video_id,
+        season=season,
+        episode=episode,
+        record_id=record_id,
+        quality_level=local_candidate.get("quality_level"),
+        quality_score=local_candidate.get("quality_score"),
+    )
+    translation_job = job_manager.start_translation_job(
+        record_id=record_id,
+        force=force,
+        db_path=db_path,
+        arabic_cache_dir=arabic_cache_dir,
+    )
+    usage_guard.record_event(
+        db_path,
+        event_type=usage_guard.EVENT_GEMINI_TRANSLATE_BACKGROUND,
+        canonical_video_key=canonical_video_key,
+        record_id=record_id,
+        job_id=str(translation_job.get("job_id") or ""),
+        details={"force": bool(force), "source": request_source, "local_first_reused": bool(local_first_reused)},
+    )
+    quality_metadata = _quality_metadata_from_history(local_candidate)
+    result = _result(
+        status="started",
+        canonical_video_key=canonical_video_key,
+        record_id=record_id,
+        job_id=translation_job.get("job_id"),
+        provider=_normalize_optional_text(local_candidate.get("provider")) or existing_record.get("source_provider"),
+        score=None,
+        message="Local cached English subtitle reused and background Arabic translation started.",
+        quality_metadata=quality_metadata or None,
+    )
+    if quality_metadata.get("quality_level") == "bad" and quality_metadata.get("quality_message"):
+        result["message"] = (
+            "Local cached English subtitle reused and background Arabic translation started. "
+            + str(quality_metadata["quality_message"])
+        )
+    result["selected_reason"] = local_reuse_reason
+    result["tried_candidates"] = []
+    result["fallback_reason"] = fallback_reason
+    result["quarantine"] = None
+    result["quarantine_affected_selection"] = False
+    result["import_history"] = updated_history
+    result["reused_existing_record"] = True
+    result["import_history_note"] = local_reuse_reason
+    result["local_first_reused"] = bool(local_first_reused)
+    result["local_reuse_reason"] = local_reuse_reason
+    if fallback_reason:
+        result["message"] += " " + str(fallback_reason)
+    _clear_active_prepare(canonical_video_key)
+    return result
+
+
+def _quality_metadata_from_history(history: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    quality_level = _normalize_optional_text((history or {}).get("quality_level"))
+    quality_score = (history or {}).get("quality_score")
+    if quality_level is None and quality_score is None:
+        return {}
+    quality_message = None
+    if quality_level == "bad":
+        quality_message = "Only a previously imported bad-quality subtitle was available locally."
+    return {
+        "quality_score": quality_score,
+        "quality_level": quality_level,
+        "quality_warnings": [],
+        "reject_hint": quality_level == "bad",
+        "quality_message": quality_message,
+    }
+
+
+def _local_reuse_reason(
+    history: Optional[Dict[str, Any]],
+    *,
+    fallback_from_bad_quality: bool = False,
+) -> str:
+    quality_level = _normalize_optional_text((history or {}).get("quality_level")) or "cached"
+    if fallback_from_bad_quality:
+        return (
+            "Provider search did not produce a better reusable subtitle, so the best local cached "
+            "import was reused with its existing {0} quality rating."
+        ).format(quality_level)
+    return (
+        "A previously imported local subtitle was reused for this title before provider search "
+        "using its existing {0} quality rating."
+    ).format(quality_level)
 
 
 def _normalize_optional_text(value: Any) -> Optional[str]:

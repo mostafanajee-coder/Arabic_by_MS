@@ -4,14 +4,20 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from services import subdl_service, subsource_service
+from services import opensubtitles_service, subdl_service, subsource_service
 from services.gemini_service import get_status as get_gemini_status
+from services.opensubtitles_service import OpenSubtitlesError, OpenSubtitlesNotConfiguredError
 from services.subdl_service import SubDLError, SubDLNotConfiguredError
 from services.subsource_service import SubSourceError, SubSourceNotConfiguredError
 
 PROVIDER_SUBDL = "subdl"
 PROVIDER_SUBSOURCE = "subsource"
-SUPPORTED_PROVIDERS = (PROVIDER_SUBDL, PROVIDER_SUBSOURCE)
+PROVIDER_OPENSUBTITLES = "opensubtitles"
+SUPPORTED_PROVIDERS = (
+    PROVIDER_SUBDL,
+    PROVIDER_SUBSOURCE,
+    PROVIDER_OPENSUBTITLES,
+)
 
 
 def get_provider_status() -> Dict[str, Any]:
@@ -20,6 +26,7 @@ def get_provider_status() -> Dict[str, Any]:
         "gemini": get_gemini_status(),
         "subdl": subdl_service.get_status(),
         "subsource": subsource_service.get_status(),
+        "opensubtitles": opensubtitles_service.get_status(),
     }
 
 
@@ -41,7 +48,6 @@ def search_all_subtitles(
     for provider in SUPPORTED_PROVIDERS:
         status = _get_single_provider_status(provider)
         if not status.get("configured"):
-            provider_errors[provider] = str(status.get("message") or "Provider is not configured.")
             continue
 
         searched_providers.append(provider)
@@ -58,9 +64,13 @@ def search_all_subtitles(
                     release_name=release_name,
                 )
             )
-        except (SubDLNotConfiguredError, SubSourceNotConfiguredError) as exc:
+        except (
+            SubDLNotConfiguredError,
+            SubSourceNotConfiguredError,
+            OpenSubtitlesNotConfiguredError,
+        ) as exc:
             provider_errors[provider] = str(exc)
-        except (SubDLError, SubSourceError) as exc:
+        except (SubDLError, SubSourceError, OpenSubtitlesError) as exc:
             provider_errors[provider] = str(exc)
 
     return {
@@ -77,6 +87,8 @@ def download_subtitle_data(provider: str, download_url: str) -> bytes:
         return subdl_service.download_subtitle_data(download_url)
     if provider_name == PROVIDER_SUBSOURCE:
         return subsource_service.download_subtitle_data(download_url)
+    if provider_name == PROVIDER_OPENSUBTITLES:
+        return opensubtitles_service.download_subtitle_data(download_url)
     raise ValueError("Unsupported provider: {0}".format(provider))
 
 
@@ -112,6 +124,16 @@ def _search_provider(
             language=language,
             release_name=release_name,
         )
+    if provider_name == PROVIDER_OPENSUBTITLES:
+        return opensubtitles_service.search_subtitles(
+            video_id=video_id,
+            video_type=video_type,
+            season=season,
+            episode=episode,
+            query=query,
+            language=language,
+            release_name=release_name,
+        )
     raise ValueError("Unsupported provider: {0}".format(provider))
 
 
@@ -121,6 +143,8 @@ def _get_single_provider_status(provider: str) -> Dict[str, Any]:
         return subdl_service.get_status()
     if provider_name == PROVIDER_SUBSOURCE:
         return subsource_service.get_status()
+    if provider_name == PROVIDER_OPENSUBTITLES:
+        return opensubtitles_service.get_status()
     raise ValueError("Unsupported provider: {0}".format(provider))
 
 

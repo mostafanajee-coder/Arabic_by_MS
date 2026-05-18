@@ -151,7 +151,7 @@ def request_prepare(
     provider_status = provider_router.get_provider_status()
     provider_ready = any(
         bool(provider_status.get(name, {}).get("configured"))
-        for name in ("subdl", "subsource")
+        for name in ("subdl", "subsource", "opensubtitles")
     )
     if not provider_ready:
         return _result(
@@ -161,7 +161,7 @@ def request_prepare(
             job_id=None,
             provider=None,
             score=None,
-            message="No subtitle provider is configured. Add SubDL and/or SubSource first.",
+            message="No subtitle provider is configured. Add SubDL, SubSource, and/or OpenSubtitles first.",
         )
 
     gemini_status = get_gemini_status()

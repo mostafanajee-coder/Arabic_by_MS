@@ -9,9 +9,8 @@ Phase 5: adds SubDL env-var settings (read at call time in
 services/subdl_service.py).
 Phase 6: adds SubSource env-var settings (read at call time in
 services/subsource_service.py).
-
-External providers other than Gemini, SubDL, and SubSource (Nvidia,
-OpenSubtitles) are intentionally NOT wired up yet.
+Phase 17: adds OpenSubtitles env-var settings (read at call time in
+services/opensubtitles_service.py).
 """
 
 from __future__ import annotations
@@ -60,10 +59,10 @@ DB_PATH: Path = CACHE_DIR / "subtitles.db"
 
 ADDON_ID: str = os.getenv("ADDON_ID", "community.arabic.by.ms")
 ADDON_NAME: str = os.getenv("ADDON_NAME", "Arabic by M.S")
-ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.15.0")
+ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.17.0")
 ADDON_DESCRIPTION: str = os.getenv(
     "ADDON_DESCRIPTION",
-    "Arabic subtitles for Stremio. Phase 15 adds usage guardrails, quota safety, and duplicate-cost prevention while keeping one-click prepare, preview, timing adjustment, preferred records, and exact movie and episode matching.",
+    "Arabic subtitles for Stremio. Phase 17 adds OpenSubtitles as an optional third English subtitle provider on top of the Phase 16 batch prepare queue, usage guardrails, one-click prepare, background jobs, preview, timing adjustment, preferred records, and exact movie and episode matching.",
 )
 
 # ---------------------------------------------------------------------------
@@ -92,6 +91,16 @@ def is_allow_auto_prepare_when_limited_enabled() -> bool:
     """Return whether auto-prepare may continue even after daily limits."""
     value = (os.getenv("ALLOW_AUTO_PREPARE_WHEN_LIMITED") or "").strip().lower()
     return value in ("1", "true", "yes", "on")
+
+
+def get_max_batch_prepare_items() -> int:
+    """Return the safe maximum number of episodes allowed in one batch request."""
+    raw = str(os.getenv("MAX_BATCH_PREPARE_ITEMS", "10") or "").strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 10
+    return value if value > 0 else 10
 
 
 def get_explicit_base_url() -> str:

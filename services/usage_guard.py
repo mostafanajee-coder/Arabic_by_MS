@@ -17,6 +17,7 @@ EVENT_GEMINI_TRANSLATE_SYNC = "gemini_translate_sync"
 EVENT_GEMINI_TRANSLATE_BACKGROUND = "gemini_translate_background"
 EVENT_PREPARE_REQUEST = "prepare_request"
 EVENT_AUTO_PREPARE_REQUEST = "auto_prepare_request"
+EVENT_BATCH_PREPARE_REQUEST = "batch_prepare_request"
 EVENT_PREPARE_SKIPPED_ALREADY_READY = "prepare_skipped_already_ready"
 EVENT_DUPLICATE_JOB_REUSED = "duplicate_job_reused"
 
@@ -237,6 +238,10 @@ def get_usage_counts(db_path: PathLike) -> Dict[str, int]:
             db_path,
             event_types=[EVENT_PREPARE_REQUEST, EVENT_AUTO_PREPARE_REQUEST],
         ),
+        "batch_prepare_requests_used": count_events_today(
+            db_path,
+            event_types=[EVENT_BATCH_PREPARE_REQUEST],
+        ),
     }
 
 
@@ -255,6 +260,7 @@ def get_usage_status(db_path: PathLike, *, auto_prepare_enabled: bool) -> Dict[s
         "provider_searches_limit": provider_limit,
         "prepare_requests_used": counts["prepare_requests_used"],
         "prepare_requests_limit": prepare_limit,
+        "batch_prepare_requests_used": counts["batch_prepare_requests_used"],
         "auto_prepare_enabled": bool(auto_prepare_enabled),
         "allow_auto_prepare_when_limited": is_allow_auto_prepare_when_limited_enabled(),
         "gemini_translations_remaining": max(

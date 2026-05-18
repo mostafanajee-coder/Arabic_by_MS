@@ -16,8 +16,10 @@ from . import config
 from .manifest import build_manifest
 from .routes_subtitles import router as subtitles_router
 from services import (
+    batch_prepare_service,
     gemini_service,
     job_manager,
+    opensubtitles_service,
     prepare_service,
     provider_router,
     subdl_service,
@@ -36,7 +38,12 @@ from services.cache_db import (
     update_record_media,
 )
 from services.gemini_service import GeminiError, GeminiNotConfiguredError, get_status as get_gemini_status
-from services.provider_router import PROVIDER_SUBDL, PROVIDER_SUBSOURCE
+from services.opensubtitles_service import OpenSubtitlesError, OpenSubtitlesNotConfiguredError
+from services.provider_router import (
+    PROVIDER_OPENSUBTITLES,
+    PROVIDER_SUBDL,
+    PROVIDER_SUBSOURCE,
+)
 from services.subdl_service import SubDLError, SubDLNotConfiguredError
 from services.subsource_service import SubSourceError, SubSourceNotConfiguredError
 from services.translation_service import (
@@ -127,6 +134,7 @@ _COMPANION_HTML = """<!doctype html>
   <div id="gemini-status" class="status-panel msg">Checking Gemini configuration...</div>
   <div id="subdl-status" class="status-panel msg">Checking SubDL configuration...</div>
   <div id="subsource-status" class="status-panel msg">Checking SubSource configuration...</div>
+  <div id="opensubtitles-status" class="status-panel msg">Checking OpenSubtitles configuration...</div>
 
   <div class="section">
     <form id="prepare-form">
@@ -164,6 +172,46 @@ _COMPANION_HTML = """<!doctype html>
       <button type="submit" class="primary">Prepare Arabic Subtitle</button>
     </form>
     <div id="prepare-result"></div>
+  </div>
+
+  <div class="section">
+    <form id="batch-prepare-form">
+      <h2>Batch Prepare Episodes</h2>
+      <div class="msg note">This can consume provider search and Gemini quota. Use small exact episode ranges and review the batch status below.</div>
+      <div class="grid">
+        <div>
+          <label for="batch_imdb_id">IMDb ID <span style="color:#dc2626">*</span></label>
+          <input id="batch_imdb_id" name="imdb_id" required placeholder="tt1234567" />
+
+          <label for="batch_season">Season <span style="color:#dc2626">*</span></label>
+          <input id="batch_season" name="season" required inputmode="numeric" placeholder="1" />
+
+          <label for="batch_query">Query fallback (optional)</label>
+          <input id="batch_query" name="query" placeholder="Series title or release hint" />
+        </div>
+        <div>
+          <label for="batch_episode_start">Episode start <span style="color:#dc2626">*</span></label>
+          <input id="batch_episode_start" name="episode_start" required inputmode="numeric" placeholder="1" />
+
+          <label for="batch_episode_end">Episode end <span style="color:#dc2626">*</span></label>
+          <input id="batch_episode_end" name="episode_end" required inputmode="numeric" placeholder="10" />
+
+          <label for="batch_release_name">Preferred release name (optional)</label>
+          <input id="batch_release_name" name="release_name" placeholder="Some.Show.S01.1080p.WEB-DL" />
+
+          <div class="check-row">
+            <input id="batch_force" name="force" type="checkbox" />
+            <label for="batch_force" style="margin:0;">Force prepare even if Arabic already exists</label>
+          </div>
+        </div>
+      </div>
+      <div class="actions" style="margin-top: 1rem;">
+        <button type="submit" class="primary">Start Batch Prepare</button>
+        <button type="button" id="cancel-batch-btn" class="secondary" disabled>Cancel Batch</button>
+      </div>
+    </form>
+    <div id="batch-prepare-result"></div>
+    <div id="batch-prepare-status" class="empty">No batch job started yet.</div>
   </div>
 
   <div class="section">
@@ -283,6 +331,39 @@ _COMPANION_HTML = """<!doctype html>
         <div id="subsource-result"></div>
         <div id="subsource-results" class="empty">No SubSource search run yet.</div>
       </div>
+
+      <div>
+        <form id="opensubtitles-form">
+          <h2>Search OpenSubtitles</h2>
+          <label for="opensubtitles_video_id">Video ID <span style="color:#dc2626">*</span> (IMDb preferred)</label>
+          <input id="opensubtitles_video_id" name="video_id" required placeholder="tt1234567" />
+
+          <label for="opensubtitles_video_type">Video type</label>
+          <select id="opensubtitles_video_type" name="video_type">
+            <option value="movie" selected>movie</option>
+            <option value="series">series</option>
+          </select>
+
+          <label for="opensubtitles_season">Season (optional)</label>
+          <input id="opensubtitles_season" name="season" inputmode="numeric" placeholder="1" />
+
+          <label for="opensubtitles_episode">Episode (optional)</label>
+          <input id="opensubtitles_episode" name="episode" inputmode="numeric" placeholder="1" />
+
+          <label for="opensubtitles_query">Query fallback (optional)</label>
+          <input id="opensubtitles_query" name="query" placeholder="Series name or release string" />
+
+          <label for="opensubtitles_language">Language</label>
+          <input id="opensubtitles_language" name="language" value="en" />
+
+          <label for="opensubtitles_release_name">Preferred release name (optional)</label>
+          <input id="opensubtitles_release_name" name="release_name" placeholder="Some.Show.S01E01.1080p.WEB-DL" />
+
+          <button type="submit" class="primary">Search OpenSubtitles</button>
+        </form>
+        <div id="opensubtitles-result"></div>
+        <div id="opensubtitles-results" class="empty">No OpenSubtitles search run yet.</div>
+      </div>
     </div>
   </div>
 
@@ -370,10 +451,14 @@ _COMPANION_HTML = """<!doctype html>
     let geminiStatus = { configured: false, model: "", message: "Checking Gemini configuration..." };
     let subdlStatus = { configured: false, base_url: "", message: "Checking SubDL configuration..." };
     let subsourceStatus = { configured: false, base_url: "", message: "Checking SubSource configuration..." };
+    let opensubtitlesStatus = { configured: false, base_url: "", message: "Checking OpenSubtitles configuration..." };
     window._subdlItems = [];
     window._subsourceItems = [];
+    window._opensubtitlesItems = [];
     window._allItems = [];
     window._jobPollers = {};
+    window._batchPollers = {};
+    window._currentBatchId = null;
     window._usageStatus = null;
 
     function escapeHtml(s) {
@@ -463,6 +548,11 @@ _COMPANION_HTML = """<!doctype html>
       renderProviderStatus("subsource-status", "SubSource", status);
     }
 
+    function renderOpensubtitlesStatus(status) {
+      opensubtitlesStatus = status;
+      renderProviderStatus("opensubtitles-status", "OpenSubtitles", status);
+    }
+
     function renderUsageStatus(data) {
       window._usageStatus = data;
       const panel = document.getElementById("usage-status-panel");
@@ -472,6 +562,7 @@ _COMPANION_HTML = """<!doctype html>
         "<br />Gemini translations: " + escapeHtml(String(data.gemini_translations_used || 0)) + "/" + escapeHtml(String(data.gemini_translations_limit || 0)) +
         " | Provider searches: " + escapeHtml(String(data.provider_searches_used || 0)) + "/" + escapeHtml(String(data.provider_searches_limit || 0)) +
         " | Prepare requests: " + escapeHtml(String(data.prepare_requests_used || 0)) + "/" + escapeHtml(String(data.prepare_requests_limit || 0)) +
+        " | Batch requests: " + escapeHtml(String(data.batch_prepare_requests_used || 0)) +
         "<br />Remaining: Gemini " + escapeHtml(String(data.gemini_translations_remaining || 0)) +
         ", Provider " + escapeHtml(String(data.provider_searches_remaining || 0)) +
         ", Prepare " + escapeHtml(String(data.prepare_requests_remaining || 0));
@@ -547,10 +638,12 @@ _COMPANION_HTML = """<!doctype html>
         renderGeminiStatus(data.gemini || {});
         renderSubdlStatus(data.subdl || {});
         renderSubsourceStatus(data.subsource || {});
+        renderOpensubtitlesStatus(data.opensubtitles || {});
       } catch (err) {
         renderGeminiStatus({ configured: false, model: "unknown", message: "Failed to load status: " + err.message });
         renderSubdlStatus({ configured: false, base_url: "unknown", message: "Failed to load status: " + err.message });
         renderSubsourceStatus({ configured: false, base_url: "unknown", message: "Failed to load status: " + err.message });
+        renderOpensubtitlesStatus({ configured: false, base_url: "unknown", message: "Failed to load status: " + err.message });
       }
     }
 
@@ -596,6 +689,136 @@ _COMPANION_HTML = """<!doctype html>
         language: "en",
         force: document.getElementById("prepare_force").checked
       };
+    }
+
+    function readBatchPreparePayload() {
+      const params = readFormValues("batch-prepare-form");
+      return {
+        imdb_id: params.get("imdb_id") || "",
+        video_type: "series",
+        season: params.get("season") || null,
+        episode_start: params.get("episode_start") || null,
+        episode_end: params.get("episode_end") || null,
+        query: params.get("query") || null,
+        release_name: params.get("release_name") || null,
+        force: document.getElementById("batch_force").checked
+      };
+    }
+
+    function batchBadgeClass(status) {
+      if (status === "completed" || status === "skipped_ready") {
+        return "done";
+      }
+      if (status === "failed" || status === "cancelled" || status === "partial") {
+        return "failed";
+      }
+      return "pending";
+    }
+
+    function renderBatchStatus(data) {
+      const result = document.getElementById("batch-prepare-status");
+      const cancelBtn = document.getElementById("cancel-batch-btn");
+      if (!data || !data.batch_id) {
+        result.className = "empty";
+        result.textContent = "No batch job started yet.";
+        cancelBtn.disabled = true;
+        window._currentBatchId = null;
+        return;
+      }
+
+      window._currentBatchId = data.batch_id;
+      const batchStatus = String(data.status || "unknown");
+      cancelBtn.disabled = !(batchStatus === "queued" || batchStatus === "running");
+
+      let warningHtml = "";
+      if (data.usage_warning && data.usage_warning.message) {
+        const warningLevel = data.usage_warning.level === "exceeded" ? "err" : "note";
+        warningHtml = "<div class='msg " + warningLevel + "'>" + escapeHtml(data.usage_warning.message) + "</div>";
+      }
+
+      let itemsHtml = "<div class='empty'>No batch items.</div>";
+      if (data.items && data.items.length) {
+        itemsHtml = "<table><thead><tr><th>Episode</th><th>Canonical</th><th>Status</th><th>Record</th><th>Job</th><th>Error</th></tr></thead><tbody>" +
+          data.items.map(item =>
+            "<tr>" +
+            "<td>S" + escapeHtml(String(item.season || "")) + "E" + escapeHtml(String(item.episode || "")) + "</td>" +
+            "<td><code>" + escapeHtml(item.canonical_video_key || "") + "</code></td>" +
+            "<td><span class='badge " + batchBadgeClass(String(item.status || "")) + "'>" + escapeHtml(String(item.status || "")) + "</span></td>" +
+            "<td>" + escapeHtml(String(item.record_id || "")) + "</td>" +
+            "<td>" + escapeHtml(String(item.job_id || "")) + "</td>" +
+            "<td>" + escapeHtml(String(item.error_message || "")) + "</td>" +
+            "</tr>"
+          ).join("") +
+          "</tbody></table>";
+      }
+
+      result.className = "";
+      result.innerHTML =
+        "<div class='msg note'>" +
+        "<strong>Batch:</strong> <code>" + escapeHtml(data.batch_id || "") + "</code>" +
+        "<br />Status: <span class='badge " + batchBadgeClass(batchStatus) + "'>" + escapeHtml(batchStatus) + "</span>" +
+        " | Done: " + escapeHtml(String(data.done_items || 0)) + "/" + escapeHtml(String(data.total_items || 0)) +
+        " | Failed: " + escapeHtml(String(data.failed_items || 0)) +
+        (data.error_message ? "<br />Message: " + escapeHtml(String(data.error_message)) : "") +
+        "</div>" +
+        warningHtml +
+        itemsHtml;
+    }
+
+    async function fetchBatchStatus(batchId) {
+      const res = await fetch("/companion/batch-status/" + encodeURIComponent(batchId));
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || "Failed to load batch status");
+      }
+      return data;
+    }
+
+    function stopBatchPolling(batchId) {
+      const poller = window._batchPollers[batchId];
+      if (poller) {
+        clearInterval(poller);
+        delete window._batchPollers[batchId];
+      }
+    }
+
+    function startBatchPolling(batchId) {
+      if (!batchId) {
+        return;
+      }
+      Object.keys(window._batchPollers).forEach(stopBatchPolling);
+      const tick = async () => {
+        try {
+          const data = await fetchBatchStatus(batchId);
+          renderBatchStatus(data);
+          if (["completed", "partial", "failed", "cancelled"].includes(String(data.status || ""))) {
+            stopBatchPolling(batchId);
+          }
+        } catch (err) {
+          stopBatchPolling(batchId);
+          const result = document.getElementById("batch-prepare-result");
+          result.innerHTML = "<div class='msg err'>" + escapeHtml(err.message) + "</div>";
+        }
+      };
+      tick();
+      window._batchPollers[batchId] = setInterval(tick, 2000);
+    }
+
+    async function refreshLatestBatch() {
+      try {
+        const res = await fetch("/companion/batch-list?limit=1");
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "Failed to load batch list");
+        }
+        const latest = (data.items || [])[0];
+        if (latest && latest.batch_id) {
+          startBatchPolling(latest.batch_id);
+        }
+      } catch (err) {
+        const result = document.getElementById("batch-prepare-result");
+        result.innerHTML = "<div class='msg err'>" + escapeHtml(err.message) + "</div>";
+      }
     }
 
     function formatProgress(record) {
@@ -831,6 +1054,23 @@ _COMPANION_HTML = """<!doctype html>
       );
     }
     window._importSubsourceResult = importSubsourceResult;
+
+    async function importOpensubtitlesResult(index, btn) {
+      return importProviderResult(
+        "_opensubtitlesItems",
+        index,
+        opensubtitlesStatus,
+        "opensubtitles-result",
+        "/companion/import-opensubtitles",
+        "opensubtitles_video_id",
+        "opensubtitles_video_type",
+        "opensubtitles_season",
+        "opensubtitles_episode",
+        "opensubtitles_release_name",
+        btn
+      );
+    }
+    window._importOpensubtitlesResult = importOpensubtitlesResult;
 
     function fillTimingForm(recordId, offsetMs, target) {
       document.getElementById("timing_record_id").value = String(recordId);
@@ -1109,7 +1349,12 @@ _COMPANION_HTML = """<!doctype html>
           return;
         }
         window[itemsName] = data.items || [];
-        renderProviderResults(resultsId, window[itemsName], itemsName === "_subdlItems" ? "_importSubdlResult" : "_importSubsourceResult", emptyText);
+        const importFnName = {
+          "_subdlItems": "_importSubdlResult",
+          "_subsourceItems": "_importSubsourceResult",
+          "_opensubtitlesItems": "_importOpensubtitlesResult"
+        }[itemsName] || "_noop";
+        renderProviderResults(resultsId, window[itemsName], importFnName, emptyText);
         result.innerHTML = "<div class='msg ok'>Found " + escapeHtml(String(window[itemsName].length)) + " result(s).</div>";
         await refreshUsage();
       } catch (err) {
@@ -1188,6 +1433,69 @@ _COMPANION_HTML = """<!doctype html>
       }
     }
 
+    async function startBatchPrepare(btn) {
+      const result = document.getElementById("batch-prepare-result");
+      result.innerHTML = "";
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "Starting...";
+      try {
+        const payload = readBatchPreparePayload();
+        const res = await fetch("/companion/batch-prepare", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          result.innerHTML = "<div class='msg err'>" + escapeHtml(data.detail || "Batch prepare failed") + "</div>";
+          return;
+        }
+        result.innerHTML = "<div class='msg note'>Batch created: <code>" + escapeHtml(data.batch_id || "") + "</code></div>";
+        renderBatchStatus(data);
+        startBatchPolling(data.batch_id);
+        await refreshUsage();
+        await refreshList();
+      } catch (err) {
+        result.innerHTML = "<div class='msg err'>" + escapeHtml(err.message) + "</div>";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+
+    async function cancelBatch(btn) {
+      const batchId = window._currentBatchId;
+      const result = document.getElementById("batch-prepare-result");
+      if (!batchId) {
+        result.innerHTML = "<div class='msg err'>No active batch to cancel.</div>";
+        return;
+      }
+
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "Cancelling...";
+      try {
+        const res = await fetch("/companion/cancel-batch/" + encodeURIComponent(batchId), {
+          method: "POST"
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          result.innerHTML = "<div class='msg err'>" + escapeHtml(data.detail || "Cancel failed") + "</div>";
+          return;
+        }
+        result.innerHTML = "<div class='msg note'>" + escapeHtml(data.message || "Batch cancelled.") + "</div>";
+        const status = await fetchBatchStatus(batchId);
+        renderBatchStatus(status);
+        await refreshUsage();
+      } catch (err) {
+        result.innerHTML = "<div class='msg err'>" + escapeHtml(err.message) + "</div>";
+      } finally {
+        btn.textContent = original;
+        btn.disabled = document.getElementById("cancel-batch-btn").disabled;
+      }
+    }
+
     document.getElementById("search-all-form").addEventListener("submit", async (e) => {
       e.preventDefault();
       const btn = e.target.querySelector("button[type='submit']");
@@ -1198,6 +1506,16 @@ _COMPANION_HTML = """<!doctype html>
       e.preventDefault();
       const btn = e.target.querySelector("button[type='submit']");
       await startPrepare(btn);
+    });
+
+    document.getElementById("batch-prepare-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const btn = e.target.querySelector("button[type='submit']");
+      await startBatchPrepare(btn);
+    });
+
+    document.getElementById("cancel-batch-btn").addEventListener("click", async function () {
+      await cancelBatch(this);
     });
 
     document.getElementById("import-best-btn").addEventListener("click", async function () {
@@ -1267,6 +1585,19 @@ _COMPANION_HTML = """<!doctype html>
       );
     });
 
+    document.getElementById("opensubtitles-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      await searchProvider(
+        "opensubtitles-form",
+        opensubtitlesStatus,
+        "opensubtitles-result",
+        "opensubtitles-results",
+        "_opensubtitlesItems",
+        "/companion/search-opensubtitles",
+        "No OpenSubtitles results found."
+      );
+    });
+
     document.getElementById("upload-form").addEventListener("submit", async (e) => {
       e.preventDefault();
       const formData = new FormData(e.target);
@@ -1325,6 +1656,7 @@ _COMPANION_HTML = """<!doctype html>
     refreshProviderStatus();
     refreshSubsourceStatus();
     refreshUsage();
+    refreshLatestBatch();
     refreshList();
   </script>
 </body>
@@ -1522,6 +1854,26 @@ def _parse_prepare_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "language": str(payload.get("language") or "en").strip() or "en",
         "release_name": _parse_optional_text(payload.get("release_name")),
         "force": _parse_bool(payload.get("force"), default=False),
+    }
+
+
+def _parse_batch_prepare_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize batch-prepare body or form payload."""
+    configured_max = config.get_max_batch_prepare_items()
+    requested_max = _parse_optional_int(payload.get("max_items"))
+    if requested_max is not None and requested_max <= 0:
+        raise HTTPException(status_code=400, detail="max_items must be a positive integer")
+    return {
+        "imdb_id": str(payload.get("imdb_id") or "").strip(),
+        "video_type": str(payload.get("video_type") or "series").strip() or "series",
+        "season": _parse_optional_int(payload.get("season")),
+        "episode_start": _parse_optional_int(payload.get("episode_start")),
+        "episode_end": _parse_optional_int(payload.get("episode_end")),
+        "query": _parse_optional_text(payload.get("query")),
+        "release_name": _parse_optional_text(payload.get("release_name")),
+        "force": _parse_bool(payload.get("force"), default=False),
+        "max_items": min(requested_max or configured_max, configured_max),
+        "configured_max_items": configured_max,
     }
 
 
@@ -1733,6 +2085,26 @@ def _usage_limit_payload(limit_name: str) -> Optional[Dict[str, Any]]:
     return usage_guard.check_limit(config.DB_PATH, limit_name=limit_name)
 
 
+def _build_usage_warning(data: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    messages = []
+    if int(data.get("gemini_translations_remaining") or 0) <= 0:
+        messages.append("Gemini daily limit is already exhausted.")
+    elif int(data.get("gemini_translations_remaining") or 0) <= 3:
+        messages.append("Gemini daily limit is close.")
+    if int(data.get("provider_searches_remaining") or 0) <= 0:
+        messages.append("Provider-search daily limit is already exhausted.")
+    elif int(data.get("provider_searches_remaining") or 0) <= 10:
+        messages.append("Provider-search daily limit is close.")
+    if int(data.get("prepare_requests_remaining") or 0) <= 0:
+        messages.append("Prepare-request daily limit is already exhausted.")
+    elif int(data.get("prepare_requests_remaining") or 0) <= 5:
+        messages.append("Prepare-request daily limit is close.")
+    if not messages:
+        return None
+    level = "exceeded" if any("exhausted" in message for message in messages) else "close"
+    return {"level": level, "message": " ".join(messages)}
+
+
 def _validate_translation_record_or_raise(record_id: int) -> Dict[str, Any]:
     record = get_record(config.DB_PATH, record_id)
     if not record:
@@ -1802,11 +2174,15 @@ def _import_provider_item(
     try:
         raw = provider_router.download_subtitle_data(provider, download_url)
         text = validate_srt_content(raw)
-    except (SubDLNotConfiguredError, SubSourceNotConfiguredError) as exc:
+    except (
+        SubDLNotConfiguredError,
+        SubSourceNotConfiguredError,
+        OpenSubtitlesNotConfiguredError,
+    ) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except SRTValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except (SubDLError, SubSourceError) as exc:
+    except (SubDLError, SubSourceError, OpenSubtitlesError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     stored = _store_english_srt_record(
@@ -1981,9 +2357,15 @@ def subsource_status() -> Dict[str, Any]:
     return subsource_service.get_status()
 
 
+@router.get("/companion/opensubtitles-status")
+def opensubtitles_status() -> Dict[str, Any]:
+    """Return whether OpenSubtitles search/import is currently configured."""
+    return opensubtitles_service.get_status()
+
+
 @router.get("/companion/provider-status")
 def provider_status() -> Dict[str, Any]:
-    """Return combined Gemini, SubDL, and SubSource configuration status."""
+    """Return combined Gemini and provider configuration status."""
     return provider_router.get_provider_status()
 
 
@@ -2024,6 +2406,76 @@ def prepare_status(canonical_video_key: str) -> Dict[str, Any]:
         canonical_video_key=str(canonical_video_key or "").strip(),
         db_path=config.DB_PATH,
     )
+
+
+@router.post("/companion/batch-prepare")
+async def batch_prepare_endpoint(request: Request) -> JSONResponse:
+    """Create a safe sequential batch episode prepare job."""
+    payload = _parse_batch_prepare_payload(await _read_request_payload(request))
+    if not payload["imdb_id"]:
+        raise HTTPException(status_code=400, detail="imdb_id is required")
+    if payload["season"] is None:
+        raise HTTPException(status_code=400, detail="season is required")
+    if payload["episode_start"] is None or payload["episode_end"] is None:
+        raise HTTPException(status_code=400, detail="episode_start and episode_end are required")
+
+    try:
+        result = batch_prepare_service.request_batch_prepare(
+            imdb_id=payload["imdb_id"],
+            video_type=payload["video_type"],
+            season=int(payload["season"]),
+            episode_start=int(payload["episode_start"]),
+            episode_end=int(payload["episode_end"]),
+            query=payload["query"],
+            release_name=payload["release_name"],
+            force=bool(payload["force"]),
+            max_items=int(payload["max_items"]),
+            db_path=config.DB_PATH,
+            english_cache_dir=config.ENGLISH_CACHE_DIR,
+            arabic_cache_dir=config.ARABIC_CACHE_DIR,
+        )
+    except batch_prepare_service.BatchPrepareError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    usage = usage_guard.get_usage_status(
+        config.DB_PATH,
+        auto_prepare_enabled=config.is_auto_prepare_on_subtitles_request_enabled(),
+    )
+    result["usage_warning"] = _build_usage_warning(usage)
+    return JSONResponse(result)
+
+
+@router.get("/companion/batch-status/{batch_id}")
+def batch_status(batch_id: str) -> Dict[str, Any]:
+    """Return one batch prepare job and its item states."""
+    payload = batch_prepare_service.get_batch_status(str(batch_id or "").strip(), config.DB_PATH)
+    if not payload:
+        raise HTTPException(status_code=404, detail=f"No batch prepare job with id={batch_id}")
+    usage = usage_guard.get_usage_status(
+        config.DB_PATH,
+        auto_prepare_enabled=config.is_auto_prepare_on_subtitles_request_enabled(),
+    )
+    payload["usage_warning"] = _build_usage_warning(usage)
+    return payload
+
+
+@router.post("/companion/cancel-batch/{batch_id}")
+def cancel_batch(batch_id: str) -> JSONResponse:
+    """Request cancellation for a running batch prepare job."""
+    payload = batch_prepare_service.cancel_batch(str(batch_id or "").strip(), config.DB_PATH)
+    if not payload:
+        raise HTTPException(status_code=404, detail=f"No batch prepare job with id={batch_id}")
+    return JSONResponse(payload)
+
+
+@router.get("/companion/batch-list")
+def batch_list(limit: int = Query(20)) -> Dict[str, Any]:
+    """Return the latest batch prepare jobs."""
+    return {
+        "items": batch_prepare_service.list_batches(
+            config.DB_PATH,
+            limit=_parse_limit(limit, default=20),
+        )
+    }
 
 
 @router.get("/companion/usage-status")
@@ -2291,6 +2743,10 @@ def diagnostics() -> Dict[str, Any]:
     except Exception:
         prepare_service_ready = False
     try:
+        batch_prepare_ready = bool(batch_prepare_service.is_ready(config.DB_PATH))
+    except Exception:
+        batch_prepare_ready = False
+    try:
         usage_columns = set(usage_guard.get_usage_table_columns(config.DB_PATH))
         usage_guard_ready = all(
             column in usage_columns
@@ -2319,15 +2775,18 @@ def diagnostics() -> Dict[str, Any]:
         "gemini_configured": bool(get_gemini_status().get("configured")),
         "subdl_configured": bool(subdl_service.get_status().get("configured")),
         "subsource_configured": bool(subsource_service.get_status().get("configured")),
+        "opensubtitles_configured": bool(opensubtitles_service.get_status().get("configured")),
         "manifest_ok": manifest_ok,
         "subtitles_route_ok": subtitles_route_ok,
         "active_translation_jobs": job_manager.active_job_count(),
+        "active_batch_jobs": batch_prepare_service.active_batch_job_count(config.DB_PATH),
         "job_manager_ready": job_manager.is_ready(),
         "status_subtitle_ready": status_subtitle_ready,
         "stremio_id_parser_ready": stremio_id_parser_ready,
         "srt_timing_ready": srt_timing_ready,
         "preferred_record_ready": preferred_record_ready,
         "prepare_service_ready": prepare_service_ready,
+        "batch_prepare_ready": batch_prepare_ready,
         "auto_prepare_enabled": config.is_auto_prepare_on_subtitles_request_enabled(),
         "usage_guard_ready": usage_guard_ready,
         "allow_auto_prepare_when_limited": config.is_allow_auto_prepare_when_limited_enabled(),
@@ -2337,6 +2796,7 @@ def diagnostics() -> Dict[str, Any]:
         "today_gemini_translations_used": usage_counts["gemini_translations_used"],
         "today_provider_searches_used": usage_counts["provider_searches_used"],
         "today_prepare_requests_used": usage_counts["prepare_requests_used"],
+        "today_batch_prepare_requests_used": usage_counts["batch_prepare_requests_used"],
     }
 
 
@@ -2510,6 +2970,43 @@ def search_subsource(
     return {"items": items}
 
 
+@router.get("/companion/search-opensubtitles")
+def search_opensubtitles(
+    video_id: str,
+    video_type: str = "movie",
+    season: Optional[int] = Query(None),
+    episode: Optional[int] = Query(None),
+    query: Optional[str] = Query(None),
+    language: str = Query("en"),
+    release_name: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    """Search OpenSubtitles and return normalized subtitle candidates."""
+    limit_response = _ensure_provider_search_allowed()
+    if limit_response:
+        return limit_response
+    identity = _resolve_video_identity(video_id, season=season, episode=episode)
+    _record_provider_search_event(
+        provider=PROVIDER_OPENSUBTITLES,
+        canonical_video_key=_parse_optional_text(identity.get("canonical_video_key")),
+        details={"video_id": video_id, "video_type": video_type},
+    )
+    try:
+        items = opensubtitles_service.search_subtitles(
+            video_id=identity["imdb_id"] or video_id,
+            video_type=video_type,
+            season=identity["season"],
+            episode=identity["episode"],
+            query=query,
+            language=language,
+            release_name=release_name,
+        )
+    except OpenSubtitlesNotConfiguredError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OpenSubtitlesError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"items": items}
+
+
 @router.get("/companion/search-all")
 def search_all(
     video_id: str,
@@ -2590,6 +3087,29 @@ async def import_subsource(request: Request) -> JSONResponse:
     )
 
 
+@router.post("/companion/import-opensubtitles")
+async def import_opensubtitles(request: Request) -> JSONResponse:
+    """Download an English SRT from OpenSubtitles, validate it, and add a DB record."""
+    payload = _parse_import_payload(await _read_request_payload(request))
+    if not payload["video_id"]:
+        raise HTTPException(status_code=400, detail="video_id is required")
+    if not payload["download_url"]:
+        raise HTTPException(status_code=400, detail="download_url is required")
+
+    return JSONResponse(
+        _import_provider_item(
+            video_id=str(payload["video_id"]),
+            video_type=str(payload["video_type"]),
+            season=payload["season"],
+            episode=payload["episode"],
+            release_name=payload["release_name"],
+            provider=PROVIDER_OPENSUBTITLES,
+            subtitle_id=payload["subtitle_id"],
+            download_url=str(payload["download_url"]),
+        )
+    )
+
+
 @router.post("/companion/import-best")
 async def import_best(request: Request) -> JSONResponse:
     """Search all providers, import the best match, and optionally translate it."""
@@ -2623,7 +3143,7 @@ async def import_best(request: Request) -> JSONResponse:
     if not items:
         raise HTTPException(
             status_code=404,
-            detail="No subtitle results found across SubDL and SubSource.",
+            detail="No subtitle results found across the configured providers.",
         )
 
     best = dict(items[0])

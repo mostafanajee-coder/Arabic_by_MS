@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend import config  # noqa: E402  (import after sys.path tweak)
+from services import batch_prepare_service  # noqa: E402
 from services import job_manager  # noqa: E402
 from services import prepare_service  # noqa: E402
 
@@ -36,6 +37,9 @@ def isolated_storage(tmp_path, monkeypatch):
     monkeypatch.delenv("SUBDL_BASE_URL", raising=False)
     monkeypatch.delenv("SUBSOURCE_API_KEY", raising=False)
     monkeypatch.delenv("SUBSOURCE_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENSUBTITLES_API_KEY", raising=False)
+    monkeypatch.delenv("OPENSUBTITLES_USER_AGENT", raising=False)
+    monkeypatch.delenv("OPENSUBTITLES_BASE_URL", raising=False)
     monkeypatch.delenv("BASE_URL", raising=False)
     monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
     monkeypatch.delenv("AUTO_PREPARE_ON_SUBTITLES_REQUEST", raising=False)
@@ -43,8 +47,11 @@ def isolated_storage(tmp_path, monkeypatch):
     monkeypatch.delenv("MAX_DAILY_GEMINI_TRANSLATIONS", raising=False)
     monkeypatch.delenv("MAX_DAILY_PROVIDER_SEARCHES", raising=False)
     monkeypatch.delenv("MAX_DAILY_PREPARE_REQUESTS", raising=False)
+    monkeypatch.delenv("MAX_BATCH_PREPARE_ITEMS", raising=False)
+    batch_prepare_service.reset_for_tests()
     job_manager.reset_for_tests()
     prepare_service.reset_for_tests()
     yield
+    batch_prepare_service.reset_for_tests()
     job_manager.reset_for_tests()
     prepare_service.reset_for_tests()

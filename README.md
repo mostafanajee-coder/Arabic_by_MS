@@ -55,9 +55,18 @@ A FastAPI Stremio subtitle addon that serves Arabic subtitles.
   prevention. The addon now tracks local provider/Gemini usage in SQLite,
   enforces safe daily limits, reuses already-running expensive jobs, and
   shows usage counters and events in Companion.
-
-Nvidia and OpenSubtitles are **not** wired up yet.
-SubDL and SubSource are the currently supported external search/import providers.
+* **Phase 16** — safe batch episode prepare queue. The companion can now
+  queue a bounded season/episode range, skip episodes that already have
+  real Arabic, reuse active prepare/translation work, process items one by
+  one in the background, cancel safely, and inspect batch status without
+  bypassing Phase 15 guardrails.
+* **Phase 17** — OpenSubtitles provider integration. The companion and
+  provider router now support OpenSubtitles as an optional third external
+  English subtitle provider, while preserving the existing SubDL, SubSource,
+  Gemini, one-click prepare, usage guard, and batch prepare workflows.
+Nvidia is **not** wired up yet.
+SubDL, SubSource, and OpenSubtitles are the currently supported external
+search/import providers.
 
 ## Project layout
 
@@ -77,8 +86,10 @@ Arabic_by_MS/
 │   ├── cache_db.py            # SQLite metadata
 │   ├── gemini_service.py      # Gemini REST client (env-driven)
 │   ├── job_manager.py         # Local background translation jobs
+│   ├── batch_prepare_service.py # Phase 16 batch episode prepare queue
 │   ├── prepare_service.py     # One-click prepare workflow + dedupe
-│   ├── provider_router.py     # Unified SubDL + SubSource router
+│   ├── provider_router.py     # Unified subtitle provider router
+│   ├── opensubtitles_service.py # OpenSubtitles search/import provider
 │   ├── subdl_service.py       # SubDL search/import provider
 │   ├── subsource_service.py   # SubSource search/import provider
 │   ├── usage_guard.py         # Daily limits + usage event tracking
@@ -113,7 +124,9 @@ Arabic_by_MS/
 │   ├── test_phase12_episode_identity.py # Phase 12 episode-aware matching
 │   ├── test_phase13_preview_timing_preferred.py # Phase 13 preview/timing/preferred
 │   ├── test_phase14_prepare_workflow.py # Phase 14 prepare workflow
-│   └── test_phase15_usage_guard.py # Phase 15 quota safety + usage tracking
+│   ├── test_phase15_usage_guard.py # Phase 15 quota safety + usage tracking
+│   ├── test_phase16_batch_prepare.py # Phase 16 batch prepare queue
+│   └── test_phase17_opensubtitles_provider.py # Phase 17 OpenSubtitles provider
 ├── requirements.txt
 ├── run.bat
 ├── .env.example
@@ -164,10 +177,17 @@ uvicorn backend.main:app --reload --port 8787
 | `GET /companion/subsource-status`             | SubSource configuration status                |
 | `GET /companion/search-subsource`             | Search SubSource for English subtitles        |
 | `POST /companion/import-subsource`            | Import a SubSource subtitle into local cache  |
-| `GET /companion/search-all`                   | Search SubDL + SubSource together             |
+| `GET /companion/opensubtitles-status`         | OpenSubtitles configuration status            |
+| `GET /companion/search-opensubtitles`         | Search OpenSubtitles for English subtitles    |
+| `POST /companion/import-opensubtitles`        | Import an OpenSubtitles subtitle into local cache |
+| `GET /companion/search-all`                   | Search all configured providers together      |
 | `POST /companion/import-best`                 | Import the highest-ranked English subtitle and optionally auto-translate it |
 | `POST /companion/prepare`                     | Search, import, and background-translate in one action |
 | `GET /companion/prepare-status/{canonical_video_key}` | Show exact-title prepare readiness, active job, and latest error |
+| `POST /companion/batch-prepare`               | Queue a safe sequential batch prepare job for series episodes |
+| `GET /companion/batch-status/{batch_id}`      | Show batch status, item states, and usage warning |
+| `POST /companion/cancel-batch/{batch_id}`     | Cancel queued batch items safely |
+| `GET /companion/batch-list`                   | Show latest batch prepare jobs |
 | `GET /companion/usage-status`                | Show today's local quota counters, limits, and remaining counts |
 | `GET /companion/usage-events`                | Show recent local usage events |
 | `POST /companion/clear-usage-events`         | Clear usage-event history only |
@@ -201,6 +221,9 @@ Phase 14 uses that same canonical key for one-click prepare and for
 duplicate-prevention when auto-prepare is enabled.
 Phase 15 keeps that exact matching and adds local usage guardrails so
 duplicate prepare/translation attempts do not burn quota twice.
+Phase 16 keeps the same canonical matching for season/episode batch runs,
+so each queued item still maps to one exact episode key such as
+`tt1234567:s01e05`.
 
 ## Installing the addon in Stremio
 
@@ -240,30 +263,37 @@ an `error_message`. Phase 8 also persists `progress_total_chunks`,
 page during translation. Existing translated files are reused unless
 `force=true` is requested.
 
-## Configuring SubDL and SubSource
+## Configuring SubDL, SubSource, and OpenSubtitles
 
 1. Copy `.env.example` to `.env`.
 2. Set `SUBDL_API_KEY=...` to use `GET /companion/search-subdl` and
    `POST /companion/import-subdl`.
 3. Set `SUBSOURCE_API_KEY=...` to use `GET /companion/search-subsource` and
    `POST /companion/import-subsource`.
-4. Leave `SUBDL_BASE_URL` and `SUBSOURCE_BASE_URL` at their defaults unless
-   you need to point at a different API environment.
-5. Restart the server and open `/companion`.
-6. Use **Search All Providers** to hit both providers together, or click
+4. Set `OPENSUBTITLES_API_KEY=...` and `OPENSUBTITLES_USER_AGENT=...` to use
+   `GET /companion/search-opensubtitles` and
+   `POST /companion/import-opensubtitles`.
+5. Leave `SUBDL_BASE_URL`, `SUBSOURCE_BASE_URL`, and
+   `OPENSUBTITLES_BASE_URL` at their defaults unless you need a different
+   API environment.
+6. Restart the server and open `/companion`.
+7. Use **Search All Providers** to hit all configured providers together, or click
    **Import Best** to store the highest-ranked English SRT immediately. If
    Gemini is configured, the same form can auto-translate it after import.
-7. For series, you can pass either `video_id=tt1234567:1:5` or
+8. For series, you can pass either `video_id=tt1234567:1:5` or
    `video_id=tt1234567` together with `season=1` and `episode=5`.
-8. Open **Preview English** or **Preview Arabic** from the companion list to
+9. Open **Preview English** or **Preview Arabic** from the companion list to
    inspect cues before choosing a preferred record or applying a timing offset.
-9. Use **Adjust Timing** or the quick `+500ms` / `-500ms` Arabic actions to
+10. Use **Adjust Timing** or the quick `+500ms` / `-500ms` Arabic actions to
    shift subtitle timing while preserving the previous file.
-10. Use **Set Preferred** to pin the translated Arabic record Stremio should
+11. Use **Set Preferred** to pin the translated Arabic record Stremio should
     serve first for that exact canonical movie or episode.
-11. Use **Prepare Arabic Subtitle** to search providers, import the best
-    English subtitle, and queue a background Arabic translation in one action.
-12. Use **Usage Guard** to inspect daily Gemini/provider usage, recent usage
+12. Use **Prepare Arabic Subtitle** to search providers, import the best
+     English subtitle, and queue a background Arabic translation in one action.
+13. Use **Batch Prepare Episodes** to queue a small episode range for the
+    same series/season while reusing active work and skipping already-ready
+    Arabic episodes.
+14. Use **Usage Guard** to inspect daily Gemini/provider usage, recent usage
     events, and clear usage-event history without touching subtitle records.
 
 ## Auto-Prepare
@@ -271,13 +301,14 @@ page during translation. Existing translated files are reused unless
 Set `AUTO_PREPARE_ON_SUBTITLES_REQUEST=true` only if you want `/subtitles`
 requests to trigger background prepare automatically when no exact Arabic
 subtitle exists yet. This never blocks the Stremio response, but it can
-consume SubDL/SubSource and Gemini quota, so the default is `false`.
+consume provider and Gemini quota, so the default is `false`.
 
-Phase 15 adds local daily guardrails:
+Phase 15 adds local daily guardrails, and Phase 16 adds a safe batch-size cap:
 
 * `MAX_DAILY_GEMINI_TRANSLATIONS=20`
 * `MAX_DAILY_PROVIDER_SEARCHES=100`
 * `MAX_DAILY_PREPARE_REQUESTS=50`
+* `MAX_BATCH_PREPARE_ITEMS=10`
 * `ALLOW_AUTO_PREPARE_WHEN_LIMITED=false`
 
 Leave `ALLOW_AUTO_PREPARE_WHEN_LIMITED=false` unless you explicitly want
@@ -291,5 +322,5 @@ pip install -r requirements.txt
 pytest
 ```
 
-All Gemini, SubDL, and SubSource calls in tests are mocked — no live API
+All Gemini, SubDL, SubSource, and OpenSubtitles calls in tests are mocked — no live API
 traffic is made.

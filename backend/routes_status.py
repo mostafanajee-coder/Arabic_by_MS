@@ -10,7 +10,7 @@ from fastapi import APIRouter
 from fastapi.responses import Response
 
 from . import config
-from services import job_manager
+from services import job_manager, prepare_service
 from services.cache_db import (
     find_best_record_for_video,
     find_latest_arabic_for_video,
@@ -55,7 +55,16 @@ def resolve_video_subtitle_state(video_id: str) -> Dict[str, Any]:
         video_id,
         canonical_video_key=identity["canonical_video_key"],
     )
+    active_prepare = prepare_service.get_active_prepare_job(identity["canonical_video_key"])
     if not records:
+        if active_prepare:
+            return {
+                "video_id": video_id,
+                "identity": identity,
+                "state": "preparing",
+                "record": None,
+                "job": active_prepare,
+            }
         return {
             "video_id": video_id,
             "identity": identity,
@@ -74,6 +83,15 @@ def resolve_video_subtitle_state(video_id: str) -> Dict[str, Any]:
                 "record": record,
                 "job": running_job,
             }
+
+    if active_prepare:
+        return {
+            "video_id": video_id,
+            "identity": identity,
+            "state": "preparing",
+            "record": records[0],
+            "job": active_prepare,
+        }
 
     record = find_best_record_for_video(
         config.DB_PATH,

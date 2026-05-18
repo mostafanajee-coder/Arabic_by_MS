@@ -47,6 +47,14 @@ A FastAPI Stremio subtitle addon that serves Arabic subtitles.
   timing without losing the previous file, save short notes such as
   release-group hints, and mark the preferred translated record for the exact
   movie or episode.
+* **Phase 14** — safe one-click prepare workflow. The companion can now
+  search all configured providers, import the best English SRT, and start a
+  background Gemini translation in one action. Optional auto-prepare can also
+  trigger this workflow from `/subtitles` without blocking Stremio.
+* **Phase 15** — usage guardrails, quota safety, and duplicate-cost
+  prevention. The addon now tracks local provider/Gemini usage in SQLite,
+  enforces safe daily limits, reuses already-running expensive jobs, and
+  shows usage counters and events in Companion.
 
 Nvidia and OpenSubtitles are **not** wired up yet.
 SubDL and SubSource are the currently supported external search/import providers.
@@ -69,9 +77,11 @@ Arabic_by_MS/
 │   ├── cache_db.py            # SQLite metadata
 │   ├── gemini_service.py      # Gemini REST client (env-driven)
 │   ├── job_manager.py         # Local background translation jobs
+│   ├── prepare_service.py     # One-click prepare workflow + dedupe
 │   ├── provider_router.py     # Unified SubDL + SubSource router
 │   ├── subdl_service.py       # SubDL search/import provider
 │   ├── subsource_service.py   # SubSource search/import provider
+│   ├── usage_guard.py         # Daily limits + usage event tracking
 │   └── translation_service.py # Orchestrates translate pipeline
 ├── utils/
 │   ├── __init__.py
@@ -101,7 +111,9 @@ Arabic_by_MS/
 │   ├── test_phase9_local_integration.py # Phase 9 local health/install/diagnostics
 │   ├── test_phase10_background_jobs.py # Phase 10 background job polling
 │   ├── test_phase12_episode_identity.py # Phase 12 episode-aware matching
-│   └── test_phase13_preview_timing_preferred.py # Phase 13 preview/timing/preferred
+│   ├── test_phase13_preview_timing_preferred.py # Phase 13 preview/timing/preferred
+│   ├── test_phase14_prepare_workflow.py # Phase 14 prepare workflow
+│   └── test_phase15_usage_guard.py # Phase 15 quota safety + usage tracking
 ├── requirements.txt
 ├── run.bat
 ├── .env.example
@@ -154,6 +166,11 @@ uvicorn backend.main:app --reload --port 8787
 | `POST /companion/import-subsource`            | Import a SubSource subtitle into local cache  |
 | `GET /companion/search-all`                   | Search SubDL + SubSource together             |
 | `POST /companion/import-best`                 | Import the highest-ranked English subtitle and optionally auto-translate it |
+| `POST /companion/prepare`                     | Search, import, and background-translate in one action |
+| `GET /companion/prepare-status/{canonical_video_key}` | Show exact-title prepare readiness, active job, and latest error |
+| `GET /companion/usage-status`                | Show today's local quota counters, limits, and remaining counts |
+| `GET /companion/usage-events`                | Show recent local usage events |
+| `POST /companion/clear-usage-events`         | Clear usage-event history only |
 | `POST /companion/translate/{record_id}`       | Translate that record's English SRT to Arabic |
 | `POST /companion/translate-background/{record_id}` | Queue a background translation job        |
 | `GET /companion/translation-status/{record_id}` | Translation progress / error state for one record |
@@ -180,6 +197,10 @@ Canonical cache keys are stored as:
 Phase 13 builds on that exact canonical identity. Preferred-record selection
 and subtitle matching are scoped to the exact movie or episode key, so one
 episode can never take another episode's translated Arabic subtitle.
+Phase 14 uses that same canonical key for one-click prepare and for
+duplicate-prevention when auto-prepare is enabled.
+Phase 15 keeps that exact matching and adds local usage guardrails so
+duplicate prepare/translation attempts do not burn quota twice.
 
 ## Installing the addon in Stremio
 
@@ -240,6 +261,28 @@ page during translation. Existing translated files are reused unless
    shift subtitle timing while preserving the previous file.
 10. Use **Set Preferred** to pin the translated Arabic record Stremio should
     serve first for that exact canonical movie or episode.
+11. Use **Prepare Arabic Subtitle** to search providers, import the best
+    English subtitle, and queue a background Arabic translation in one action.
+12. Use **Usage Guard** to inspect daily Gemini/provider usage, recent usage
+    events, and clear usage-event history without touching subtitle records.
+
+## Auto-Prepare
+
+Set `AUTO_PREPARE_ON_SUBTITLES_REQUEST=true` only if you want `/subtitles`
+requests to trigger background prepare automatically when no exact Arabic
+subtitle exists yet. This never blocks the Stremio response, but it can
+consume SubDL/SubSource and Gemini quota, so the default is `false`.
+
+Phase 15 adds local daily guardrails:
+
+* `MAX_DAILY_GEMINI_TRANSLATIONS=20`
+* `MAX_DAILY_PROVIDER_SEARCHES=100`
+* `MAX_DAILY_PREPARE_REQUESTS=50`
+* `ALLOW_AUTO_PREPARE_WHEN_LIMITED=false`
+
+Leave `ALLOW_AUTO_PREPARE_WHEN_LIMITED=false` unless you explicitly want
+auto-prepare to keep consuming provider/Gemini quota after the local daily
+limits are reached.
 
 ## Running the tests
 

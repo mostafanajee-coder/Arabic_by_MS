@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 
 from backend import config  # noqa: E402  (import after sys.path tweak)
 from services import job_manager  # noqa: E402
+from services import prepare_service  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +38,13 @@ def isolated_storage(tmp_path, monkeypatch):
     monkeypatch.delenv("SUBSOURCE_BASE_URL", raising=False)
     monkeypatch.delenv("BASE_URL", raising=False)
     monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    monkeypatch.delenv("AUTO_PREPARE_ON_SUBTITLES_REQUEST", raising=False)
+    monkeypatch.delenv("ALLOW_AUTO_PREPARE_WHEN_LIMITED", raising=False)
+    monkeypatch.delenv("MAX_DAILY_GEMINI_TRANSLATIONS", raising=False)
+    monkeypatch.delenv("MAX_DAILY_PROVIDER_SEARCHES", raising=False)
+    monkeypatch.delenv("MAX_DAILY_PREPARE_REQUESTS", raising=False)
     job_manager.reset_for_tests()
+    prepare_service.reset_for_tests()
     yield
     job_manager.reset_for_tests()
+    prepare_service.reset_for_tests()

@@ -15,7 +15,15 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from . import config
 from .manifest import build_manifest
 from .routes_subtitles import router as subtitles_router
-from services import gemini_service, job_manager, provider_router, subdl_service, subsource_service
+from services import (
+    gemini_service,
+    job_manager,
+    prepare_service,
+    provider_router,
+    subdl_service,
+    subsource_service,
+    usage_guard,
+)
 from services.cache_db import (
     delete_record,
     get_record,
@@ -119,6 +127,44 @@ _COMPANION_HTML = """<!doctype html>
   <div id="gemini-status" class="status-panel msg">Checking Gemini configuration...</div>
   <div id="subdl-status" class="status-panel msg">Checking SubDL configuration...</div>
   <div id="subsource-status" class="status-panel msg">Checking SubSource configuration...</div>
+
+  <div class="section">
+    <form id="prepare-form">
+      <h2>Prepare Arabic Subtitle</h2>
+      <div class="grid">
+        <div>
+          <label for="prepare_video_id">Video ID <span style="color:#dc2626">*</span></label>
+          <input id="prepare_video_id" name="video_id" required placeholder="tt1234567 or tt1234567:1:5" />
+
+          <label for="prepare_video_type">Video type</label>
+          <select id="prepare_video_type" name="video_type">
+            <option value="movie" selected>movie</option>
+            <option value="series">series</option>
+          </select>
+
+          <label for="prepare_query">Query fallback (optional)</label>
+          <input id="prepare_query" name="query" placeholder="Movie title or release string" />
+        </div>
+        <div>
+          <label for="prepare_season">Season (optional)</label>
+          <input id="prepare_season" name="season" inputmode="numeric" placeholder="1" />
+
+          <label for="prepare_episode">Episode (optional)</label>
+          <input id="prepare_episode" name="episode" inputmode="numeric" placeholder="5" />
+
+          <label for="prepare_release_name">Preferred release name (optional)</label>
+          <input id="prepare_release_name" name="release_name" placeholder="Some.Show.S01E05.1080p.WEB-DL" />
+
+          <div class="check-row">
+            <input id="prepare_force" name="force" type="checkbox" />
+            <label for="prepare_force" style="margin:0;">Force prepare even if Arabic already exists</label>
+          </div>
+        </div>
+      </div>
+      <button type="submit" class="primary">Prepare Arabic Subtitle</button>
+    </form>
+    <div id="prepare-result"></div>
+  </div>
 
   <div class="section">
     <form id="search-all-form">
@@ -305,6 +351,17 @@ _COMPANION_HTML = """<!doctype html>
   </div>
 
   <div class="section">
+    <h2>Usage Guard</h2>
+    <div id="usage-status-panel" class="status-panel msg note">Loading usage counters...</div>
+    <div id="usage-warning" class="empty">Auto-prepare is disabled.</div>
+    <div class="actions" style="margin-top: 0.75rem;">
+      <button type="button" id="clear-usage-events-btn" class="secondary">Clear Usage Events</button>
+    </div>
+    <div id="usage-clear-result"></div>
+    <div id="usage-events" class="empty">Loading usage events...</div>
+  </div>
+
+  <div class="section">
     <h2>Uploaded Subtitles</h2>
     <div id="list" class="empty">Loading...</div>
   </div>
@@ -317,6 +374,7 @@ _COMPANION_HTML = """<!doctype html>
     window._subsourceItems = [];
     window._allItems = [];
     window._jobPollers = {};
+    window._usageStatus = null;
 
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, c => ({
@@ -405,6 +463,59 @@ _COMPANION_HTML = """<!doctype html>
       renderProviderStatus("subsource-status", "SubSource", status);
     }
 
+    function renderUsageStatus(data) {
+      window._usageStatus = data;
+      const panel = document.getElementById("usage-status-panel");
+      panel.className = "status-panel msg note";
+      panel.innerHTML =
+        "<strong>Today:</strong> " + escapeHtml(data.today || "") +
+        "<br />Gemini translations: " + escapeHtml(String(data.gemini_translations_used || 0)) + "/" + escapeHtml(String(data.gemini_translations_limit || 0)) +
+        " | Provider searches: " + escapeHtml(String(data.provider_searches_used || 0)) + "/" + escapeHtml(String(data.provider_searches_limit || 0)) +
+        " | Prepare requests: " + escapeHtml(String(data.prepare_requests_used || 0)) + "/" + escapeHtml(String(data.prepare_requests_limit || 0)) +
+        "<br />Remaining: Gemini " + escapeHtml(String(data.gemini_translations_remaining || 0)) +
+        ", Provider " + escapeHtml(String(data.provider_searches_remaining || 0)) +
+        ", Prepare " + escapeHtml(String(data.prepare_requests_remaining || 0));
+
+      const warning = document.getElementById("usage-warning");
+      if (data.auto_prepare_enabled) {
+        warning.className = "msg note";
+        warning.innerHTML =
+          "<strong>Warning:</strong> auto-prepare on subtitle requests is enabled." +
+          " Allow when limited: <code>" + escapeHtml(String(!!data.allow_auto_prepare_when_limited)) + "</code>.";
+      } else {
+        warning.className = "empty";
+        warning.textContent = "Auto-prepare is disabled.";
+      }
+    }
+
+    function renderUsageEvents(items) {
+      const node = document.getElementById("usage-events");
+      if (!items || items.length === 0) {
+        node.className = "empty";
+        node.textContent = "No usage events recorded yet.";
+        return;
+      }
+      node.className = "";
+      node.innerHTML = `<table>
+        <thead><tr>
+          <th>#</th><th>Event</th><th>Provider</th><th>Canonical</th><th>Record</th><th>Job</th><th>Units</th><th>Details</th><th>Created (UTC)</th>
+        </tr></thead>
+        <tbody>${items.map(item => `
+          <tr>
+            <td>${escapeHtml(String(item.id || ""))}</td>
+            <td>${escapeHtml(item.event_type || "")}</td>
+            <td>${escapeHtml(item.provider || "")}</td>
+            <td>${escapeHtml(item.canonical_video_key || "")}</td>
+            <td>${escapeHtml(item.record_id ?? "")}</td>
+            <td>${escapeHtml(item.job_id || "")}</td>
+            <td>${escapeHtml(String(item.units || 0))}</td>
+            <td>${escapeHtml(item.details || "")}</td>
+            <td>${escapeHtml(item.created_at || "")}</td>
+          </tr>`).join("")}
+        </tbody>
+      </table>`;
+    }
+
     async function refreshInstallInfo() {
       try {
         const res = await fetch("/companion/install-info");
@@ -443,6 +554,26 @@ _COMPANION_HTML = """<!doctype html>
       }
     }
 
+    async function refreshUsage() {
+      try {
+        const [statusRes, eventsRes] = await Promise.all([
+          fetch("/companion/usage-status"),
+          fetch("/companion/usage-events?limit=12")
+        ]);
+        const statusData = await statusRes.json();
+        const eventsData = await eventsRes.json();
+        renderUsageStatus(statusData);
+        renderUsageEvents(eventsData.items || []);
+      } catch (err) {
+        const panel = document.getElementById("usage-status-panel");
+        panel.className = "status-panel msg err";
+        panel.textContent = "Failed to load usage status: " + err.message;
+        const events = document.getElementById("usage-events");
+        events.className = "empty";
+        events.textContent = "Failed to load usage events.";
+      }
+    }
+
     async function refreshSubsourceStatus() {
       try {
         const res = await fetch("/companion/subsource-status");
@@ -451,6 +582,20 @@ _COMPANION_HTML = """<!doctype html>
       } catch (err) {
         renderSubsourceStatus({ configured: false, base_url: "unknown", message: "Failed to load SubSource status: " + err.message });
       }
+    }
+
+    function readPreparePayload() {
+      const params = readFormValues("prepare-form");
+      return {
+        video_id: params.get("video_id") || "",
+        video_type: params.get("video_type") || "movie",
+        season: params.get("season") || null,
+        episode: params.get("episode") || null,
+        query: params.get("query") || null,
+        release_name: params.get("release_name") || null,
+        language: "en",
+        force: document.getElementById("prepare_force").checked
+      };
     }
 
     function formatProgress(record) {
@@ -511,6 +656,7 @@ _COMPANION_HTML = """<!doctype html>
           if (status.status === "completed" || status.status === "failed") {
             stopJobPolling(jobId);
             await refreshList();
+            await refreshUsage();
           }
         } catch (err) {
           stopJobPolling(jobId);
@@ -548,10 +694,16 @@ _COMPANION_HTML = """<!doctype html>
         const suffix = force ? "?force=true" : "";
         const res = await fetch("/companion/translate/" + recordId + suffix, { method: "POST" });
         const data = await res.json();
+        if (data.status === "limit_exceeded") {
+          if (msg) msg.innerHTML = "<span class='msg err'>" + escapeHtml(data.message || "Daily limit exceeded") + "</span>";
+          await refreshUsage();
+          return;
+        }
         if (!res.ok && msg) {
           msg.innerHTML = "<span class='msg err'>" + escapeHtml(data.detail || "Translate failed") + "</span>";
         }
         await refreshList();
+        await refreshUsage();
       } catch (err) {
         if (msg) msg.innerHTML = "<span class='msg err'>" + escapeHtml(err.message) + "</span>";
       } finally {
@@ -576,6 +728,11 @@ _COMPANION_HTML = """<!doctype html>
         const suffix = force ? "?force=true" : "";
         const res = await fetch("/companion/translate-background/" + recordId + suffix, { method: "POST" });
         const data = await res.json();
+        if (data.status === "limit_exceeded") {
+          if (msg) msg.innerHTML = "<span class='msg err'>" + escapeHtml(data.message || "Daily limit exceeded") + "</span>";
+          await refreshUsage();
+          return;
+        }
         if (!res.ok) {
           if (msg) msg.innerHTML = "<span class='msg err'>" + escapeHtml(data.detail || "Background translate failed") + "</span>";
           return;
@@ -587,6 +744,7 @@ _COMPANION_HTML = """<!doctype html>
         }
         if (msg) msg.innerHTML = "<span class='msg note'>Background job " + escapeHtml(data.job_id || "") + " started.</span>";
         await refreshList();
+        await refreshUsage();
         if (data.job_id) {
           startJobPolling(data.job_id, recordId);
         }
@@ -630,6 +788,7 @@ _COMPANION_HTML = """<!doctype html>
         } else {
           box.innerHTML = "<div class='msg ok'>Imported as record #" + escapeHtml(data.id) + ".</div>";
           await refreshList();
+          await refreshUsage();
         }
       } catch (err) {
         box.innerHTML = "<div class='msg err'>" + escapeHtml(err.message) + "</div>";
@@ -938,6 +1097,12 @@ _COMPANION_HTML = """<!doctype html>
       try {
         const res = await fetch(endpoint + "?" + params.toString());
         const data = await res.json();
+        if (data.status === "limit_exceeded") {
+          result.innerHTML = "<div class='msg err'>" + escapeHtml(data.message || "Provider search limit reached") + "</div>";
+          renderProviderResults(resultsId, [], "_noop", emptyText);
+          await refreshUsage();
+          return;
+        }
         if (!res.ok) {
           result.innerHTML = "<div class='msg err'>" + escapeHtml(data.detail || "Provider search failed") + "</div>";
           renderProviderResults(resultsId, [], "_noop", emptyText);
@@ -946,6 +1111,7 @@ _COMPANION_HTML = """<!doctype html>
         window[itemsName] = data.items || [];
         renderProviderResults(resultsId, window[itemsName], itemsName === "_subdlItems" ? "_importSubdlResult" : "_importSubsourceResult", emptyText);
         result.innerHTML = "<div class='msg ok'>Found " + escapeHtml(String(window[itemsName].length)) + " result(s).</div>";
+        await refreshUsage();
       } catch (err) {
         result.innerHTML = "<div class='msg err'>" + escapeHtml(err.message) + "</div>";
       }
@@ -961,6 +1127,12 @@ _COMPANION_HTML = """<!doctype html>
         const params = readFormValues("search-all-form");
         const res = await fetch("/companion/search-all?" + params.toString());
         const data = await res.json();
+        if (data.status === "limit_exceeded") {
+          result.innerHTML = "<div class='msg err'>" + escapeHtml(data.message || "Provider search limit reached") + "</div>";
+          renderSearchAllResults([], {}, []);
+          await refreshUsage();
+          return;
+        }
         if (!res.ok) {
           result.innerHTML = "<div class='msg err'>" + escapeHtml(data.detail || "Unified search failed") + "</div>";
           renderSearchAllResults([], {}, []);
@@ -969,6 +1141,45 @@ _COMPANION_HTML = """<!doctype html>
         window._allItems = data.items || [];
         renderSearchAllResults(window._allItems, data.provider_errors || {}, data.searched_providers || []);
         result.innerHTML = "<div class='msg ok'>Found " + escapeHtml(String(window._allItems.length)) + " ranked result(s).</div>";
+        await refreshUsage();
+      } catch (err) {
+        result.innerHTML = "<div class='msg err'>" + escapeHtml(err.message) + "</div>";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+
+    async function startPrepare(btn) {
+      const result = document.getElementById("prepare-result");
+      result.innerHTML = "";
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "Preparing...";
+      try {
+        const payload = readPreparePayload();
+        const res = await fetch("/companion/prepare", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          result.innerHTML = "<div class='msg err'>" + escapeHtml(data.detail || "Prepare failed") + "</div>";
+          return;
+        }
+        const level = data.status === "limit_exceeded" ? "err" : "note";
+        result.innerHTML = "<div class='msg " + level + "'>" +
+          escapeHtml(data.message || data.status || "Prepare result") +
+          (data.provider ? "<br />Provider: " + escapeHtml(String(data.provider)) : "") +
+          (data.record_id ? "<br />Record ID: " + escapeHtml(String(data.record_id)) : "") +
+          (data.job_id ? "<br />Job ID: " + escapeHtml(String(data.job_id)) : "") +
+          "</div>";
+        await refreshList();
+        await refreshUsage();
+        if (data.job_id && data.record_id) {
+          startJobPolling(data.job_id, data.record_id);
+        }
       } catch (err) {
         result.innerHTML = "<div class='msg err'>" + escapeHtml(err.message) + "</div>";
       } finally {
@@ -981,6 +1192,12 @@ _COMPANION_HTML = """<!doctype html>
       e.preventDefault();
       const btn = e.target.querySelector("button[type='submit']");
       await searchAllProviders(btn);
+    });
+
+    document.getElementById("prepare-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const btn = e.target.querySelector("button[type='submit']");
+      await startPrepare(btn);
     });
 
     document.getElementById("import-best-btn").addEventListener("click", async function () {
@@ -997,6 +1214,11 @@ _COMPANION_HTML = """<!doctype html>
           body: JSON.stringify(payload)
         });
         const data = await res.json();
+        if (data.status === "limit_exceeded") {
+          result.innerHTML = "<div class='msg err'>" + escapeHtml(data.message || "Daily limit exceeded") + "</div>";
+          await refreshUsage();
+          return;
+        }
         if (!res.ok) {
           result.innerHTML = "<div class='msg err'>" + escapeHtml(data.detail || "Import best failed") + "</div>";
           return;
@@ -1007,6 +1229,7 @@ _COMPANION_HTML = """<!doctype html>
           escapeHtml(data.provider) + " as record #" + escapeHtml(String(data.record_id)) +
           " (" + escapeHtml(data.status) + ")" + escapeHtml(translated) + "." + background + "</div>";
         await refreshList();
+        await refreshUsage();
         if (data.job_id) {
           startJobPolling(data.job_id, data.record_id);
         }
@@ -1058,6 +1281,7 @@ _COMPANION_HTML = """<!doctype html>
           result.innerHTML = "<div class='msg ok'>Uploaded as record #" + escapeHtml(data.id) + " (status: " + escapeHtml(data.status) + ").</div>";
           e.target.reset();
           await refreshList();
+          await refreshUsage();
         }
       } catch (err) {
         result.innerHTML = "<div class='msg err'>" + escapeHtml(err.message) + "</div>";
@@ -1073,10 +1297,34 @@ _COMPANION_HTML = """<!doctype html>
       await adjustRecordTiming(Number(recordId), Number(offsetMs), target, force, null);
     });
 
+    document.getElementById("clear-usage-events-btn").addEventListener("click", async function () {
+      const result = document.getElementById("usage-clear-result");
+      result.innerHTML = "";
+      this.disabled = true;
+      const original = this.textContent;
+      this.textContent = "Clearing...";
+      try {
+        const res = await fetch("/companion/clear-usage-events", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) {
+          result.innerHTML = "<div class='msg err'>" + escapeHtml(data.detail || "Clear failed") + "</div>";
+          return;
+        }
+        result.innerHTML = "<div class='msg ok'>Deleted " + escapeHtml(String(data.deleted_count || 0)) + " usage event(s).</div>";
+        await refreshUsage();
+      } catch (err) {
+        result.innerHTML = "<div class='msg err'>" + escapeHtml(err.message) + "</div>";
+      } finally {
+        this.disabled = false;
+        this.textContent = original;
+      }
+    });
+
     refreshInstallInfo();
     refreshHealth();
     refreshProviderStatus();
     refreshSubsourceStatus();
+    refreshUsage();
     refreshList();
   </script>
 </body>
@@ -1260,6 +1508,20 @@ def _parse_import_best_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             payload.get("background_translate"),
             default=False,
         ),
+    }
+
+
+def _parse_prepare_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize prepare body or form payload."""
+    return {
+        "video_id": str(payload.get("video_id") or "").strip(),
+        "video_type": str(payload.get("video_type") or "movie").strip() or "movie",
+        "season": _parse_optional_int(payload.get("season")),
+        "episode": _parse_optional_int(payload.get("episode")),
+        "query": _parse_optional_text(payload.get("query")),
+        "language": str(payload.get("language") or "en").strip() or "en",
+        "release_name": _parse_optional_text(payload.get("release_name")),
+        "force": _parse_bool(payload.get("force"), default=False),
     }
 
 
@@ -1449,6 +1711,83 @@ def _record_has_translated_arabic(record: Dict[str, Any]) -> bool:
     )
 
 
+def _translation_json_payload(record: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": record.get("id"),
+        "video_id": record.get("video_id"),
+        "video_type": record.get("video_type"),
+        "status": record.get("status"),
+        "arabic_srt_path": record.get("arabic_srt_path"),
+        "error_message": record.get("error_message"),
+        "progress_total_chunks": record.get("progress_total_chunks"),
+        "progress_done_chunks": record.get("progress_done_chunks"),
+        "progress_message": record.get("progress_message"),
+    }
+
+
+def _record_canonical_key(record: Dict[str, Any]) -> Optional[str]:
+    return _parse_optional_text(record.get("canonical_video_key"))
+
+
+def _usage_limit_payload(limit_name: str) -> Optional[Dict[str, Any]]:
+    return usage_guard.check_limit(config.DB_PATH, limit_name=limit_name)
+
+
+def _validate_translation_record_or_raise(record_id: int) -> Dict[str, Any]:
+    record = get_record(config.DB_PATH, record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"No subtitle record with id={record_id}")
+
+    english_path = _record_file_path(record, "english")
+    if not english_path or not english_path.exists():
+        _translate_record_or_raise(record_id, force=False)
+    else:
+        try:
+            parse_srt(english_path.read_text(encoding="utf-8"))
+        except (OSError, SRTParseError):
+            _translate_record_or_raise(record_id, force=False)
+    return get_record(config.DB_PATH, record_id) or record
+
+
+def _ensure_provider_search_allowed() -> Optional[JSONResponse]:
+    limit = _usage_limit_payload(usage_guard.LIMIT_PROVIDER_SEARCHES)
+    if limit:
+        return JSONResponse(limit)
+    return None
+
+
+def _record_provider_search_event(
+    *,
+    provider: Optional[str] = None,
+    canonical_video_key: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    usage_guard.record_event(
+        config.DB_PATH,
+        event_type=usage_guard.EVENT_PROVIDER_SEARCH,
+        provider=provider,
+        canonical_video_key=canonical_video_key,
+        details=details,
+    )
+
+
+def _record_provider_import_event(
+    *,
+    provider: Optional[str],
+    canonical_video_key: Optional[str],
+    record_id: int,
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    usage_guard.record_event(
+        config.DB_PATH,
+        event_type=usage_guard.EVENT_PROVIDER_IMPORT,
+        provider=provider,
+        canonical_video_key=canonical_video_key,
+        record_id=record_id,
+        details=details,
+    )
+
+
 def _import_provider_item(
     *,
     video_id: str,
@@ -1470,7 +1809,7 @@ def _import_provider_item(
     except (SubDLError, SubSourceError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    return _store_english_srt_record(
+    stored = _store_english_srt_record(
         video_id=video_id,
         video_type=video_type,
         season=season,
@@ -1481,6 +1820,13 @@ def _import_provider_item(
         source_subtitle_id=subtitle_id,
         source_download_url=download_url,
     )
+    _record_provider_import_event(
+        provider=provider,
+        canonical_video_key=_parse_optional_text(stored.get("canonical_video_key")),
+        record_id=int(stored["id"]),
+        details={"video_id": video_id, "video_type": video_type},
+    )
+    return stored
 
 
 def _translate_record_or_raise(record_id: int, *, force: bool) -> Dict[str, Any]:
@@ -1540,12 +1886,38 @@ def _start_background_translation(record_id: int, *, force: bool) -> Dict[str, A
             "error_message": None,
         }
 
-    return job_manager.start_translation_job(
+    running_job = job_manager.get_running_job_for_record(record_id)
+    if running_job:
+        usage_guard.record_event(
+            config.DB_PATH,
+            event_type=usage_guard.EVENT_DUPLICATE_JOB_REUSED,
+            canonical_video_key=_record_canonical_key(record),
+            record_id=record_id,
+            job_id=str(running_job.get("job_id") or ""),
+            details={"source": "translate-background"},
+        )
+        return running_job
+
+    _validate_translation_record_or_raise(record_id)
+    limit = _usage_limit_payload(usage_guard.LIMIT_GEMINI_TRANSLATIONS)
+    if limit:
+        return limit
+
+    job = job_manager.start_translation_job(
         record_id=record_id,
         force=force,
         db_path=config.DB_PATH,
         arabic_cache_dir=config.ARABIC_CACHE_DIR,
     )
+    usage_guard.record_event(
+        config.DB_PATH,
+        event_type=usage_guard.EVENT_GEMINI_TRANSLATE_BACKGROUND,
+        canonical_video_key=_record_canonical_key(record),
+        record_id=record_id,
+        job_id=str(job.get("job_id") or ""),
+        details={"force": bool(force)},
+    )
+    return job
 
 
 @router.post("/companion/upload-srt")
@@ -1619,6 +1991,72 @@ def provider_status() -> Dict[str, Any]:
 def install_info(request: Request) -> Dict[str, str]:
     """Return the local URLs needed to install and use the addon."""
     return _install_info(request)
+
+
+@router.post("/companion/prepare")
+async def prepare_endpoint(request: Request) -> JSONResponse:
+    """Search, import, and background-translate the best subtitle in one action."""
+    payload = _parse_prepare_payload(await _read_request_payload(request))
+    if not payload["video_id"]:
+        raise HTTPException(status_code=400, detail="video_id is required")
+
+    result = prepare_service.request_prepare(
+        video_id=payload["video_id"],
+        video_type=payload["video_type"],
+        season=payload["season"],
+        episode=payload["episode"],
+        query=payload["query"],
+        release_name=payload["release_name"],
+        language=payload["language"],
+        force=bool(payload["force"]),
+        db_path=config.DB_PATH,
+        english_cache_dir=config.ENGLISH_CACHE_DIR,
+        arabic_cache_dir=config.ARABIC_CACHE_DIR,
+        run_async=False,
+    )
+    return JSONResponse(result)
+
+
+@router.get("/companion/prepare-status/{canonical_video_key}")
+def prepare_status(canonical_video_key: str) -> Dict[str, Any]:
+    """Return readiness, latest record, and active prepare/translation job details."""
+    return prepare_service.get_prepare_status(
+        canonical_video_key=str(canonical_video_key or "").strip(),
+        db_path=config.DB_PATH,
+    )
+
+
+@router.get("/companion/usage-status")
+def usage_status() -> Dict[str, Any]:
+    """Return today's local usage counters and remaining daily limits."""
+    return usage_guard.get_usage_status(
+        config.DB_PATH,
+        auto_prepare_enabled=config.is_auto_prepare_on_subtitles_request_enabled(),
+    )
+
+
+@router.get("/companion/usage-events")
+def usage_events(
+    limit: int = Query(50),
+    event_type: Optional[str] = Query(None),
+    provider: Optional[str] = Query(None),
+) -> Dict[str, Any]:
+    """Return latest usage events for local quota diagnostics."""
+    return {
+        "items": usage_guard.list_events(
+            config.DB_PATH,
+            limit=_parse_limit(limit, default=50),
+            event_type=_parse_optional_text(event_type),
+            provider=_parse_optional_text(provider),
+        )
+    }
+
+
+@router.post("/companion/clear-usage-events")
+def clear_usage_events() -> JSONResponse:
+    """Delete usage events only and return the deleted row count."""
+    deleted = usage_guard.clear_events(config.DB_PATH)
+    return JSONResponse({"status": "cleared", "deleted_count": deleted})
 
 
 @router.get("/companion/translation-status/{record_id}")
@@ -1779,6 +2217,8 @@ def set_preferred(record_id: int) -> JSONResponse:
 def translate_background(record_id: int, force: bool = Query(False)) -> JSONResponse:
     """Start a background translation job and return immediately."""
     job = _start_background_translation(record_id, force=force)
+    if job.get("status") == "limit_exceeded":
+        return JSONResponse(job)
     return JSONResponse(
         {
             "job_id": job.get("job_id"),
@@ -1846,6 +2286,30 @@ def diagnostics() -> Dict[str, Any]:
         )
     except Exception:
         preferred_record_ready = False
+    try:
+        prepare_service_ready = bool(prepare_service.is_ready())
+    except Exception:
+        prepare_service_ready = False
+    try:
+        usage_columns = set(usage_guard.get_usage_table_columns(config.DB_PATH))
+        usage_guard_ready = all(
+            column in usage_columns
+            for column in (
+                "id",
+                "event_type",
+                "provider",
+                "canonical_video_key",
+                "record_id",
+                "job_id",
+                "units",
+                "details",
+                "created_at",
+            )
+        )
+    except Exception:
+        usage_guard_ready = False
+    usage_limits = usage_guard.get_daily_limits()
+    usage_counts = usage_guard.get_usage_counts(config.DB_PATH)
     return {
         "python_app_import_ok": python_app_import_ok,
         "cache_db_ready": _cache_db_ready(),
@@ -1863,6 +2327,16 @@ def diagnostics() -> Dict[str, Any]:
         "stremio_id_parser_ready": stremio_id_parser_ready,
         "srt_timing_ready": srt_timing_ready,
         "preferred_record_ready": preferred_record_ready,
+        "prepare_service_ready": prepare_service_ready,
+        "auto_prepare_enabled": config.is_auto_prepare_on_subtitles_request_enabled(),
+        "usage_guard_ready": usage_guard_ready,
+        "allow_auto_prepare_when_limited": config.is_allow_auto_prepare_when_limited_enabled(),
+        "max_daily_gemini_translations": usage_limits[usage_guard.LIMIT_GEMINI_TRANSLATIONS],
+        "max_daily_provider_searches": usage_limits[usage_guard.LIMIT_PROVIDER_SEARCHES],
+        "max_daily_prepare_requests": usage_limits[usage_guard.LIMIT_PREPARE_REQUESTS],
+        "today_gemini_translations_used": usage_counts["gemini_translations_used"],
+        "today_provider_searches_used": usage_counts["provider_searches_used"],
+        "today_prepare_requests_used": usage_counts["prepare_requests_used"],
     }
 
 
@@ -1973,7 +2447,15 @@ def search_subdl(
     release_name: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
     """Search SubDL and return normalized subtitle candidates."""
+    limit_response = _ensure_provider_search_allowed()
+    if limit_response:
+        return limit_response
     identity = _resolve_video_identity(video_id, season=season, episode=episode)
+    _record_provider_search_event(
+        provider=PROVIDER_SUBDL,
+        canonical_video_key=_parse_optional_text(identity.get("canonical_video_key")),
+        details={"video_id": video_id, "video_type": video_type},
+    )
     try:
         items = subdl_service.search_subtitles(
             video_id=identity["imdb_id"] or video_id,
@@ -2002,7 +2484,15 @@ def search_subsource(
     release_name: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
     """Search SubSource and return normalized subtitle candidates."""
+    limit_response = _ensure_provider_search_allowed()
+    if limit_response:
+        return limit_response
     identity = _resolve_video_identity(video_id, season=season, episode=episode)
+    _record_provider_search_event(
+        provider=PROVIDER_SUBSOURCE,
+        canonical_video_key=_parse_optional_text(identity.get("canonical_video_key")),
+        details={"video_id": video_id, "video_type": video_type},
+    )
     try:
         items = subsource_service.search_subtitles(
             video_id=identity["imdb_id"] or video_id,
@@ -2033,7 +2523,15 @@ def search_all(
     """Search all configured providers and return ranked combined results."""
     if not video_id or not video_id.strip():
         raise HTTPException(status_code=400, detail="video_id is required")
+    limit_response = _ensure_provider_search_allowed()
+    if limit_response:
+        return limit_response
     identity = _resolve_video_identity(video_id, season=season, episode=episode)
+    _record_provider_search_event(
+        provider="all",
+        canonical_video_key=_parse_optional_text(identity.get("canonical_video_key")),
+        details={"video_id": video_id, "video_type": video_type},
+    )
 
     return provider_router.search_all_subtitles(
         video_id=identity["imdb_id"] or video_id,
@@ -2098,10 +2596,18 @@ async def import_best(request: Request) -> JSONResponse:
     payload = _parse_import_best_payload(await _read_request_payload(request))
     if not payload["video_id"]:
         raise HTTPException(status_code=400, detail="video_id is required")
+    limit_response = _ensure_provider_search_allowed()
+    if limit_response:
+        return limit_response
     identity = _resolve_video_identity(
         payload["video_id"],
         season=payload["season"],
         episode=payload["episode"],
+    )
+    _record_provider_search_event(
+        provider="all",
+        canonical_video_key=_parse_optional_text(identity.get("canonical_video_key")),
+        details={"video_id": payload["video_id"], "video_type": payload["video_type"]},
     )
 
     search_result = provider_router.search_all_subtitles(
@@ -2169,17 +2675,28 @@ async def import_best(request: Request) -> JSONResponse:
 @router.post("/companion/translate/{record_id}")
 def translate_endpoint(record_id: int, force: bool = Query(False)) -> JSONResponse:
     """Translate the English SRT for `record_id` and persist the Arabic file."""
-    updated = _translate_record_or_raise(record_id, force=force)
-    return JSONResponse(
-        {
-            "id": updated.get("id"),
-            "video_id": updated.get("video_id"),
-            "video_type": updated.get("video_type"),
-            "status": updated.get("status"),
-            "arabic_srt_path": updated.get("arabic_srt_path"),
-            "error_message": updated.get("error_message"),
-            "progress_total_chunks": updated.get("progress_total_chunks"),
-            "progress_done_chunks": updated.get("progress_done_chunks"),
-            "progress_message": updated.get("progress_message"),
-        }
+    record = get_record(config.DB_PATH, record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"No subtitle record with id={record_id}")
+    if _record_has_translated_arabic(record) and not force:
+        return JSONResponse(_translation_json_payload(record))
+
+    gemini_status = get_gemini_status()
+    if not gemini_status.get("configured"):
+        updated = _translate_record_or_raise(record_id, force=force)
+        return JSONResponse(_translation_json_payload(updated))
+
+    _validate_translation_record_or_raise(record_id)
+    limit = _usage_limit_payload(usage_guard.LIMIT_GEMINI_TRANSLATIONS)
+    if limit:
+        return JSONResponse(limit)
+
+    usage_guard.record_event(
+        config.DB_PATH,
+        event_type=usage_guard.EVENT_GEMINI_TRANSLATE_SYNC,
+        canonical_video_key=_record_canonical_key(record),
+        record_id=record_id,
+        details={"force": bool(force)},
     )
+    updated = _translate_record_or_raise(record_id, force=force)
+    return JSONResponse(_translation_json_payload(updated))

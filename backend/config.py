@@ -60,10 +60,10 @@ DB_PATH: Path = CACHE_DIR / "subtitles.db"
 
 ADDON_ID: str = os.getenv("ADDON_ID", "community.arabic.by.ms")
 ADDON_NAME: str = os.getenv("ADDON_NAME", "Arabic by M.S")
-ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.13.0")
+ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.15.0")
 ADDON_DESCRIPTION: str = os.getenv(
     "ADDON_DESCRIPTION",
-    "Arabic subtitles for Stremio. Phase 13 adds subtitle preview, timing offset adjustments, and preferred record management while keeping exact movie and episode matching.",
+    "Arabic subtitles for Stremio. Phase 15 adds usage guardrails, quota safety, and duplicate-cost prevention while keeping one-click prepare, preview, timing adjustment, preferred records, and exact movie and episode matching.",
 )
 
 # ---------------------------------------------------------------------------
@@ -80,6 +80,18 @@ PUBLIC_BASE_URL: str = (
     or os.getenv("PUBLIC_BASE_URL")
     or f"http://127.0.0.1:{PORT}"
 )
+
+
+def is_auto_prepare_on_subtitles_request_enabled() -> bool:
+    """Return whether /subtitles should trigger background prepare attempts."""
+    value = (os.getenv("AUTO_PREPARE_ON_SUBTITLES_REQUEST") or "").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+def is_allow_auto_prepare_when_limited_enabled() -> bool:
+    """Return whether auto-prepare may continue even after daily limits."""
+    value = (os.getenv("ALLOW_AUTO_PREPARE_WHEN_LIMITED") or "").strip().lower()
+    return value in ("1", "true", "yes", "on")
 
 
 def get_explicit_base_url() -> str:

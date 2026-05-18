@@ -128,6 +128,10 @@ def test_init_db_adds_error_message_column_to_existing_db(tmp_path) -> None:
             row[1]
             for row in conn.execute("PRAGMA table_info(subtitles)").fetchall()
         }
+    assert "imdb_id" in columns
+    assert "season" in columns
+    assert "episode" in columns
+    assert "canonical_video_key" in columns
     assert "error_message" in columns
     assert "source_provider" in columns
     assert "source_subtitle_id" in columns
@@ -190,3 +194,29 @@ def test_translation_progress_helpers() -> None:
     assert reset["progress_total_chunks"] is None
     assert reset["progress_done_chunks"] is None
     assert reset["progress_message"] is None
+
+
+def test_insert_and_lookup_with_canonical_episode_key() -> None:
+    rid = insert_subtitle(
+        config.DB_PATH,
+        video_id="tt6666666:1:5",
+        imdb_id="tt6666666",
+        season=1,
+        episode=5,
+        canonical_video_key="tt6666666:s01e05",
+        video_type="series",
+        release_name="Episode.Test",
+        english_srt_path="/tmp/f.srt",
+        english_srt_hash="fff",
+    )
+    set_arabic_srt(config.DB_PATH, rid, "/tmp/f.ar.srt", status="translated")
+
+    hit = find_latest_arabic_for_video(
+        config.DB_PATH,
+        "tt6666666:1:5",
+        canonical_video_key="tt6666666:s01e05",
+    )
+    assert hit is not None
+    assert hit["canonical_video_key"] == "tt6666666:s01e05"
+    assert hit["season"] == 1
+    assert hit["episode"] == 5

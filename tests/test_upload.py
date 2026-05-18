@@ -39,10 +39,12 @@ def test_companion_page_loads(client: TestClient) -> None:
     assert response.headers["content-type"].startswith("text/html")
     assert "Arabic by M.S" in response.text
     assert 'name="srt_file"' in response.text
+    assert "Install in Stremio" in response.text
     assert "Gemini status" in response.text
     assert "Search All Providers" in response.text
     assert "Search SubDL" in response.text
     assert "Search SubSource" in response.text
+    assert "Arabic by M.S - Status" in response.text
 
 
 # ---- upload --------------------------------------------------------------
@@ -133,8 +135,8 @@ def test_companion_list_returns_uploaded_records(client: TestClient) -> None:
 # ---- subtitles endpoint cache fallback ----------------------------------
 
 
-def test_subtitles_falls_back_to_sample_when_no_arabic_cached(client: TestClient) -> None:
-    """Uploading English doesn't populate Arabic, so we keep returning the sample."""
+def test_subtitles_returns_status_when_no_arabic_cached(client: TestClient) -> None:
+    """Uploading English without Arabic should return a status subtitle, not a fake fallback."""
     client.post(
         "/companion/upload-srt",
         data={"video_id": "tt7777777"},
@@ -143,9 +145,9 @@ def test_subtitles_falls_back_to_sample_when_no_arabic_cached(client: TestClient
     response = client.get("/subtitles/movie/tt7777777.json")
     assert response.status_code == 200
     sub = response.json()["subtitles"][0]
-    # Sample-shaped id (Phase 1 fallback), not cached-N.
-    assert sub["id"].startswith("arabic-ms-")
-    assert sub["name"] == "Arabic by M.S"
+    assert sub["id"].startswith("status-")
+    assert sub["name"] == "Arabic by M.S - Status"
+    assert "/status-subtitle/" in sub["url"]
 
 
 def test_subtitles_returns_cached_when_arabic_present(client: TestClient, tmp_path) -> None:

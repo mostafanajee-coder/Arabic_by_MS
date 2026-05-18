@@ -20,6 +20,8 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from fastapi import Request
+
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -58,10 +60,10 @@ DB_PATH: Path = CACHE_DIR / "subtitles.db"
 
 ADDON_ID: str = os.getenv("ADDON_ID", "community.arabic.by.ms")
 ADDON_NAME: str = os.getenv("ADDON_NAME", "Arabic by M.S")
-ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.8.0")
+ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.12.0")
 ADDON_DESCRIPTION: str = os.getenv(
     "ADDON_DESCRIPTION",
-    "Arabic subtitles for Stremio. Phase 8 hardens Gemini translation with chunked progress tracking, safer retries, and Arabic SRT quality checks.",
+    "Arabic subtitles for Stremio. Phase 12 adds episode-aware canonical matching for tt1234567 and tt1234567:1:5 while keeping honest status subtitles until real Arabic is ready.",
 )
 
 # ---------------------------------------------------------------------------
@@ -73,4 +75,27 @@ PORT: int = int(os.getenv("PORT", "8787"))
 
 # Public base URL used when building absolute subtitle download links.
 # When running locally Stremio talks to http://127.0.0.1:PORT.
-PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", f"http://127.0.0.1:{PORT}")
+PUBLIC_BASE_URL: str = (
+    os.getenv("BASE_URL")
+    or os.getenv("PUBLIC_BASE_URL")
+    or f"http://127.0.0.1:{PORT}"
+)
+
+
+def get_explicit_base_url() -> str:
+    """Return an explicitly configured public base URL when available."""
+    return (
+        (os.getenv("BASE_URL") or "").strip()
+        or (os.getenv("PUBLIC_BASE_URL") or "").strip()
+        or ""
+    ).rstrip("/")
+
+
+def get_base_url(request: Optional[Request] = None) -> str:
+    """Return the best base URL for building local links."""
+    explicit = get_explicit_base_url()
+    if explicit:
+        return explicit
+    if request is not None:
+        return str(request.base_url).rstrip("/")
+    return PUBLIC_BASE_URL.rstrip("/")

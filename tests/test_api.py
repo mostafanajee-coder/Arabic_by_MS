@@ -28,8 +28,8 @@ def test_manifest_endpoint(client: TestClient) -> None:
     assert "movie" in data["types"]
 
 
-def test_subtitles_endpoint_returns_single_arabic_item(client: TestClient) -> None:
-    """/subtitles/{type}/{id}.json returns one item named Arabic by M.S."""
+def test_subtitles_endpoint_returns_single_status_item_when_real_arabic_missing(client: TestClient) -> None:
+    """/subtitles/{type}/{id}.json returns a status subtitle until real Arabic exists."""
     response = client.get("/subtitles/movie/tt1234567.json")
     assert response.status_code == 200
 
@@ -40,9 +40,9 @@ def test_subtitles_endpoint_returns_single_arabic_item(client: TestClient) -> No
 
     item = subs[0]
     assert item["lang"] == "ara"
-    assert item["name"] == "Arabic by M.S"
+    assert item["name"] == "Arabic by M.S - Status"
     assert item["url"].endswith(".srt")
-    assert "/download/" in item["url"]
+    assert "/status-subtitle/" in item["url"]
 
 
 def test_sample_srt_download_endpoint(client: TestClient) -> None:

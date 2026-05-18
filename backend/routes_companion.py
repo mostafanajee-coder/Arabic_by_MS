@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -11,13 +13,11 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Upload
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import config
-from services import provider_router, subdl_service, subsource_service
-from services.cache_db import get_record, insert_subtitle, list_subtitles
-from services.gemini_service import (
-    GeminiError,
-    GeminiNotConfiguredError,
-    get_status as get_gemini_status,
-)
+from .manifest import build_manifest
+from .routes_subtitles import router as subtitles_router
+from services import gemini_service, job_manager, provider_router, subdl_service, subsource_service
+from services.cache_db import delete_record, get_record, init_db, insert_subtitle, list_subtitles
+from services.gemini_service import GeminiError, GeminiNotConfiguredError, get_status as get_gemini_status
 from services.provider_router import PROVIDER_SUBDL, PROVIDER_SUBSOURCE
 from services.subdl_service import SubDLError, SubDLNotConfiguredError
 from services.subsource_service import SubSourceError, SubSourceNotConfiguredError
@@ -30,6 +30,8 @@ from services.translation_service import (
 from utils.hash_utils import sha256_text
 from utils.srt_cleaner import TranslationFormatError
 from utils.srt_quality import SRTQualityError
+from utils.status_srt import build_status_srt
+from utils.stremio_id import parse_stremio_video_id
 from utils.srt_validator import (
     SRTValidationError,
     validate_srt_content,
@@ -88,8 +90,20 @@ _COMPANION_HTML = """<!doctype html>
 </head>
 <body>
   <h1>Arabic by M.S - Companion</h1>
-  <p class="sub">Upload an English <code>.srt</code>, search providers, or import the best ranked English subtitle and optionally translate it to Arabic with Gemini.</p>
+  <p class="sub">Upload an English <code>.srt</code>, search providers, or import the best ranked English subtitle and optionally translate it to Arabic with Gemini. Until a real Arabic file is ready, Stremio will show <code>Arabic by M.S - Status</code> instead of pretending a translation already exists.</p>
 
+  <div id="install-info" class="status-panel msg note">
+    <strong>Install in Stremio:</strong><br />
+    Manifest URL<br />
+    <input id="manifest-url" value="http://localhost:8787/manifest.json" readonly />
+    <div class="summary">Open Stremio and install via URL using the manifest above.</div>
+  </div>
+  <div class="status-panel msg note">
+    <strong>Stremio subtitle types:</strong><br />
+    <code>Arabic by M.S</code> = a real cached Arabic subtitle file is ready.<br />
+    <code>Arabic by M.S - Status</code> = a generated guidance subtitle telling you to upload, translate, retry, or wait.
+  </div>
+  <div id="health-status" class="status-panel msg">Checking local health...</div>
   <div id="gemini-status" class="status-panel msg">Checking Gemini configuration...</div>
   <div id="subdl-status" class="status-panel msg">Checking SubDL configuration...</div>
   <div id="subsource-status" class="status-panel msg">Checking SubSource configuration...</div>
@@ -127,6 +141,10 @@ _COMPANION_HTML = """<!doctype html>
           <div class="check-row">
             <input id="all_auto_translate" name="auto_translate" type="checkbox" />
             <label for="all_auto_translate" style="margin:0;">Auto translate after import</label>
+          </div>
+          <div class="check-row">
+            <input id="all_background_translate" name="background_translate" type="checkbox" />
+            <label for="all_background_translate" style="margin:0;">Run auto translate in background</label>
           </div>
         </div>
       </div>
@@ -213,14 +231,20 @@ _COMPANION_HTML = """<!doctype html>
   <div class="section">
     <h2>Manual Upload</h2>
     <form id="upload-form" enctype="multipart/form-data">
-      <label for="video_id">Video ID <span style="color:#dc2626">*</span> (e.g. <code>tt1234567</code>)</label>
-      <input id="video_id" name="video_id" required placeholder="tt1234567" />
+      <label for="video_id">Video ID <span style="color:#dc2626">*</span> (e.g. <code>tt1234567</code> or <code>tt1234567:1:5</code>)</label>
+      <input id="video_id" name="video_id" required placeholder="tt1234567 or tt1234567:1:5" />
 
       <label for="video_type">Video type</label>
       <select id="video_type" name="video_type">
         <option value="movie" selected>movie</option>
         <option value="series">series</option>
       </select>
+
+      <label for="season">Season (optional)</label>
+      <input id="season" name="season" inputmode="numeric" placeholder="1" />
+
+      <label for="episode">Episode (optional)</label>
+      <input id="episode" name="episode" inputmode="numeric" placeholder="5" />
 
       <label for="release_name">Release name (optional)</label>
       <input id="release_name" name="release_name" placeholder="Some.Movie.2024.1080p.WEB-DL" />
@@ -246,6 +270,7 @@ _COMPANION_HTML = """<!doctype html>
     window._subdlItems = [];
     window._subsourceItems = [];
     window._allItems = [];
+    window._jobPollers = {};
 
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, c => ({
@@ -274,8 +299,33 @@ _COMPANION_HTML = """<!doctype html>
         query: params.get("query") || null,
         language: params.get("language") || "en",
         release_name: params.get("release_name") || null,
-        auto_translate: document.getElementById("all_auto_translate").checked
+        auto_translate: document.getElementById("all_auto_translate").checked,
+        background_translate: document.getElementById("all_background_translate").checked
       };
+    }
+
+    function renderInstallInfo(info) {
+      const el = document.getElementById("install-info");
+      const manifestInput = document.getElementById("manifest-url");
+      const manifestUrl = info.manifest_url || "http://localhost:8787/manifest.json";
+      manifestInput.value = manifestUrl;
+      el.className = "status-panel msg note";
+      el.innerHTML =
+        "<strong>Install in Stremio:</strong><br />Manifest URL<br />" +
+        "<input id='manifest-url' value='" + escapeHtml(manifestUrl) + "' readonly />" +
+        "<div class='summary'>Base URL: <code>" + escapeHtml(info.base_url || "http://localhost:8787") + "</code><br />" +
+        "Companion: <code>" + escapeHtml(info.companion_url || "") + "</code></div>";
+    }
+
+    function renderHealthStatus(health) {
+      const el = document.getElementById("health-status");
+      const ok = health.status === "ok";
+      el.className = "status-panel " + (ok ? "msg ok" : "msg err");
+      el.innerHTML =
+        "<strong>Local health:</strong> " + escapeHtml(health.status || "unknown") +
+        "<br />DB ready: " + escapeHtml(String(!!health.cache_db_ready)) +
+        " | cache dirs ready: " + escapeHtml(String(!!health.cache_dirs_ready)) +
+        " | status subtitle ready: " + escapeHtml(String(!!health.status_subtitle_ready));
     }
 
     function renderGeminiStatus(status) {
@@ -307,6 +357,30 @@ _COMPANION_HTML = """<!doctype html>
     function renderSubsourceStatus(status) {
       subsourceStatus = status;
       renderProviderStatus("subsource-status", "SubSource", status);
+    }
+
+    async function refreshInstallInfo() {
+      try {
+        const res = await fetch("/companion/install-info");
+        const data = await res.json();
+        renderInstallInfo(data);
+      } catch (err) {
+        renderInstallInfo({
+          manifest_url: "http://localhost:8787/manifest.json",
+          companion_url: "http://localhost:8787/companion",
+          base_url: "http://localhost:8787"
+        });
+      }
+    }
+
+    async function refreshHealth() {
+      try {
+        const res = await fetch("/health");
+        const data = await res.json();
+        renderHealthStatus(data);
+      } catch (err) {
+        renderHealthStatus({ status: "error", cache_db_ready: false, cache_dirs_ready: false });
+      }
     }
 
     async function refreshProviderStatus() {
@@ -355,6 +429,51 @@ _COMPANION_HTML = """<!doctype html>
       return data;
     }
 
+    async function fetchJobStatus(jobId) {
+      const res = await fetch("/companion/job-status/" + jobId);
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || "Failed to load job status");
+      }
+      return data;
+    }
+
+    function stopJobPolling(jobId) {
+      const poller = window._jobPollers[jobId];
+      if (poller) {
+        clearInterval(poller);
+        delete window._jobPollers[jobId];
+      }
+    }
+
+    function startJobPolling(jobId, recordId) {
+      stopJobPolling(jobId);
+      const tick = async () => {
+        try {
+          const status = await fetchJobStatus(jobId);
+          const msg = document.getElementById("row-msg-" + recordId);
+          const progress = formatProgress(status);
+          if (msg) {
+            const pieces = [];
+            pieces.push("Job: " + (status.status || "unknown"));
+            if (progress) pieces.push(progress);
+            if (status.error_message && status.status === "failed") pieces.push(status.error_message);
+            msg.innerHTML = "<span class='msg " +
+              (status.status === "failed" ? "err" : "note") +
+              "'>" + escapeHtml(pieces.join(" | ")) + "</span>";
+          }
+          if (status.status === "completed" || status.status === "failed") {
+            stopJobPolling(jobId);
+            await refreshList();
+          }
+        } catch (err) {
+          stopJobPolling(jobId);
+        }
+      };
+      tick();
+      window._jobPollers[jobId] = setInterval(tick, 2000);
+    }
+
     async function translateRecord(recordId, btn, force) {
       const msg = document.getElementById("row-msg-" + recordId);
       if (!geminiStatus.configured) {
@@ -397,7 +516,44 @@ _COMPANION_HTML = """<!doctype html>
     }
     window._translateRecord = translateRecord;
 
-    async function importProviderResult(itemsName, index, status, resultElementId, endpoint, videoIdInputId, videoTypeInputId, releaseNameInputId, btn) {
+    async function translateBackground(recordId, btn, force) {
+      const msg = document.getElementById("row-msg-" + recordId);
+      if (!geminiStatus.configured) {
+        if (msg) msg.innerHTML = "<span class='msg err'>" + escapeHtml(geminiStatus.message) + "</span>";
+        return;
+      }
+
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = "Queueing...";
+      try {
+        const suffix = force ? "?force=true" : "";
+        const res = await fetch("/companion/translate-background/" + recordId + suffix, { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) {
+          if (msg) msg.innerHTML = "<span class='msg err'>" + escapeHtml(data.detail || "Background translate failed") + "</span>";
+          return;
+        }
+        if (data.status === "already_translated") {
+          if (msg) msg.innerHTML = "<span class='msg note'>Arabic subtitle already exists.</span>";
+          await refreshList();
+          return;
+        }
+        if (msg) msg.innerHTML = "<span class='msg note'>Background job " + escapeHtml(data.job_id || "") + " started.</span>";
+        await refreshList();
+        if (data.job_id) {
+          startJobPolling(data.job_id, recordId);
+        }
+      } catch (err) {
+        if (msg) msg.innerHTML = "<span class='msg err'>" + escapeHtml(err.message) + "</span>";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+    window._translateBackground = translateBackground;
+
+    async function importProviderResult(itemsName, index, status, resultElementId, endpoint, videoIdInputId, videoTypeInputId, seasonInputId, episodeInputId, releaseNameInputId, btn) {
       const box = document.getElementById(resultElementId);
       if (!status.configured) {
         box.innerHTML = "<div class='msg err'>" + escapeHtml(status.message) + "</div>";
@@ -415,6 +571,8 @@ _COMPANION_HTML = """<!doctype html>
           body: JSON.stringify({
             video_id: document.getElementById(videoIdInputId).value,
             video_type: document.getElementById(videoTypeInputId).value,
+            season: document.getElementById(seasonInputId).value || null,
+            episode: document.getElementById(episodeInputId).value || null,
             release_name: item.release_name || document.getElementById(releaseNameInputId).value || null,
             subtitle_id: item.subtitle_id || null,
             download_url: item.download_url
@@ -444,6 +602,8 @@ _COMPANION_HTML = """<!doctype html>
         "/companion/import-subdl",
         "subdl_video_id",
         "subdl_video_type",
+        "subdl_season",
+        "subdl_episode",
         "subdl_release_name",
         btn
       );
@@ -459,6 +619,8 @@ _COMPANION_HTML = """<!doctype html>
         "/companion/import-subsource",
         "subsource_video_id",
         "subsource_video_type",
+        "subsource_season",
+        "subsource_episode",
         "subsource_release_name",
         btn
       );
@@ -543,22 +705,30 @@ _COMPANION_HTML = """<!doctype html>
             ? "done"
             : (r.status === "failed" ? "failed" : "pending");
           const progress = formatProgress(r);
-          let action = "<button onclick='_translateRecord(" + r.id + ", this, false)'>Translate</button>";
+          let action = "<button onclick='_translateRecord(" + r.id + ", this, false)'>Translate</button>" +
+            "<button onclick='_translateBackground(" + r.id + ", this, false)'>Translate in Background</button>";
           if (r.status === "failed") {
-            action = "<button onclick='_translateRecord(" + r.id + ", this, false)'>Retry Translate</button>";
+            action = "<button onclick='_translateRecord(" + r.id + ", this, false)'>Retry Translate</button>" +
+              "<button onclick='_translateBackground(" + r.id + ", this, false)'>Retry in Background</button>";
           } else if (r.arabic_srt_path) {
             action = "<span class='badge done'>Arabic available</span>";
           }
           if (r.status === "translated" || r.arabic_srt_path) {
-            action += "<button onclick='_translateRecord(" + r.id + ", this, true)'>Force Retranslate</button>";
+            action += "<button onclick='_translateRecord(" + r.id + ", this, true)'>Force Retranslate</button>" +
+              "<button onclick='_translateBackground(" + r.id + ", this, true)'>Force Background Retranslate</button>";
           } else if (r.status === "failed") {
-            action += "<button onclick='_translateRecord(" + r.id + ", this, true)'>Force Retranslate</button>";
+            action += "<button onclick='_translateRecord(" + r.id + ", this, true)'>Force Retranslate</button>" +
+              "<button onclick='_translateBackground(" + r.id + ", this, true)'>Force Background Retranslate</button>";
           }
           return `
             <tr>
               <td>${r.id}</td>
               <td>${escapeHtml(r.video_id)}</td>
+              <td>${escapeHtml(r.canonical_video_key || "")}</td>
+              <td>${escapeHtml(r.imdb_id || "")}</td>
               <td>${escapeHtml(r.video_type)}</td>
+              <td>${escapeHtml(r.season ?? "")}</td>
+              <td>${escapeHtml(r.episode ?? "")}</td>
               <td>${escapeHtml(r.release_name || "")}</td>
               <td>${escapeHtml(r.source_provider || "")}</td>
               <td><span class="badge ${badgeClass}">${escapeHtml(r.status)}</span></td>
@@ -571,7 +741,7 @@ _COMPANION_HTML = """<!doctype html>
         list.className = "";
         list.innerHTML = `<table>
           <thead><tr>
-            <th>#</th><th>Video ID</th><th>Type</th><th>Release</th><th>Source</th>
+            <th>#</th><th>Video ID</th><th>Canonical</th><th>IMDb</th><th>Type</th><th>Season</th><th>Episode</th><th>Release</th><th>Source</th>
             <th>Status</th><th>Error</th><th>Progress</th><th>Action</th><th>Created (UTC)</th>
           </tr></thead>
           <tbody>${rows}</tbody>
@@ -657,10 +827,14 @@ _COMPANION_HTML = """<!doctype html>
           return;
         }
         const translated = data.arabic_srt_path ? " translated" : "";
+        const background = data.job_id ? " background job " + escapeHtml(String(data.job_id)) + "." : "";
         result.innerHTML = "<div class='msg ok'>Imported best result from " +
           escapeHtml(data.provider) + " as record #" + escapeHtml(String(data.record_id)) +
-          " (" + escapeHtml(data.status) + ")" + escapeHtml(translated) + ".</div>";
+          " (" + escapeHtml(data.status) + ")" + escapeHtml(translated) + "." + background + "</div>";
         await refreshList();
+        if (data.job_id) {
+          startJobPolling(data.job_id, data.record_id);
+        }
       } catch (err) {
         result.innerHTML = "<div class='msg err'>" + escapeHtml(err.message) + "</div>";
       } finally {
@@ -715,6 +889,8 @@ _COMPANION_HTML = """<!doctype html>
       }
     });
 
+    refreshInstallInfo();
+    refreshHealth();
     refreshProviderStatus();
     refreshSubsourceStatus();
     refreshList();
@@ -725,6 +901,34 @@ _COMPANION_HTML = """<!doctype html>
 
 
 _SAFE_VIDEO_ID = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _cache_dirs_ready() -> bool:
+    try:
+        config.ENGLISH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        config.ARABIC_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        return config.ENGLISH_CACHE_DIR.exists() and config.ARABIC_CACHE_DIR.exists()
+    except OSError:
+        return False
+
+
+def _cache_db_ready() -> bool:
+    try:
+        init_db(config.DB_PATH)
+        return config.DB_PATH.exists()
+    except OSError:
+        return False
+
+
+def _install_info(request: Request) -> Dict[str, str]:
+    base_url = config.get_base_url(request)
+    return {
+        "manifest_url": f"{base_url}/manifest.json",
+        "companion_url": f"{base_url}/companion",
+        "base_url": base_url,
+        "addon_name": config.ADDON_NAME,
+        "version": config.ADDON_VERSION,
+    }
 
 
 @router.get("/companion", response_class=HTMLResponse)
@@ -738,10 +942,23 @@ def _slug_video_id(video_id: str) -> str:
     return _SAFE_VIDEO_ID.sub("_", video_id.strip()) or "unknown"
 
 
+def _resolve_video_identity(
+    video_id: str,
+    *,
+    season: Optional[int] = None,
+    episode: Optional[int] = None,
+) -> Dict[str, Any]:
+    identity = parse_stremio_video_id(video_id, season=season, episode=episode)
+    identity["raw_video_id"] = str(video_id or "").strip()
+    return identity
+
+
 def _store_english_srt_record(
     *,
     video_id: str,
     video_type: str,
+    season: Optional[int],
+    episode: Optional[int],
     release_name: Optional[str],
     text: str,
     source_provider: Optional[str] = None,
@@ -760,6 +977,11 @@ def _store_english_srt_record(
 
     normalized_video_id = video_id.strip()
     normalized_video_type = (video_type or "movie").strip() or "movie"
+    identity = _resolve_video_identity(
+        normalized_video_id,
+        season=season,
+        episode=episode,
+    )
     normalized_release_name = release_name.strip() if release_name else None
     normalized_source_provider = (
         source_provider.strip().lower() if source_provider else None
@@ -775,6 +997,10 @@ def _store_english_srt_record(
     record_id = insert_subtitle(
         config.DB_PATH,
         video_id=normalized_video_id,
+        imdb_id=identity["imdb_id"] or None,
+        season=identity["season"],
+        episode=identity["episode"],
+        canonical_video_key=identity["canonical_video_key"] or None,
         video_type=normalized_video_type,
         release_name=normalized_release_name,
         english_srt_path=str(target),
@@ -789,6 +1015,11 @@ def _store_english_srt_record(
     return {
         "id": record_id,
         "video_id": normalized_video_id,
+        "imdb_id": identity["imdb_id"] or None,
+        "season": identity["season"],
+        "episode": identity["episode"],
+        "canonical_video_key": identity["canonical_video_key"] or None,
+        "is_episode": identity["is_episode"],
         "video_type": normalized_video_type,
         "release_name": normalized_release_name,
         "english_srt_path": str(target),
@@ -805,11 +1036,13 @@ def _store_english_srt_record(
     }
 
 
-def _parse_import_payload(payload: Dict[str, Any]) -> Dict[str, Optional[str]]:
+def _parse_import_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize provider import payload fields."""
     return {
         "video_id": str(payload.get("video_id") or "").strip(),
         "video_type": str(payload.get("video_type") or "movie").strip() or "movie",
+        "season": _parse_optional_int(payload.get("season")),
+        "episode": _parse_optional_int(payload.get("episode")),
         "release_name": (
             str(payload.get("release_name")).strip()
             if payload.get("release_name") not in (None, "")
@@ -836,6 +1069,10 @@ def _parse_import_best_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "release_name": _parse_optional_text(payload.get("release_name")),
         "auto_translate": _parse_bool(payload.get("auto_translate"), default=False),
         "force_translate": _parse_bool(payload.get("force_translate"), default=False),
+        "background_translate": _parse_bool(
+            payload.get("background_translate"),
+            default=False,
+        ),
     }
 
 
@@ -881,6 +1118,8 @@ def _import_provider_item(
     *,
     video_id: str,
     video_type: str,
+    season: Optional[int],
+    episode: Optional[int],
     release_name: Optional[str],
     provider: str,
     subtitle_id: Optional[str],
@@ -899,6 +1138,8 @@ def _import_provider_item(
     return _store_english_srt_record(
         video_id=video_id,
         video_type=video_type,
+        season=season,
+        episode=episode,
         release_name=release_name,
         text=text,
         source_provider=provider,
@@ -937,10 +1178,47 @@ def _translate_record_or_raise(record_id: int, *, force: bool) -> Dict[str, Any]
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+def _start_background_translation(record_id: int, *, force: bool) -> Dict[str, Any]:
+    """Validate a record and start or reuse a background translation job."""
+    record = get_record(config.DB_PATH, record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail=f"No subtitle record with id={record_id}")
+
+    gemini_status = get_gemini_status()
+    if not gemini_status.get("configured"):
+        raise HTTPException(
+            status_code=400,
+            detail=str(gemini_status.get("message") or "Gemini is not configured."),
+        )
+
+    arabic_path = _parse_optional_text(record.get("arabic_srt_path"))
+    if (
+        not force
+        and record.get("status") == "translated"
+        and arabic_path
+        and Path(arabic_path).exists()
+    ):
+        return {
+            "job_id": None,
+            "record_id": record_id,
+            "status": "already_translated",
+            "error_message": None,
+        }
+
+    return job_manager.start_translation_job(
+        record_id=record_id,
+        force=force,
+        db_path=config.DB_PATH,
+        arabic_cache_dir=config.ARABIC_CACHE_DIR,
+    )
+
+
 @router.post("/companion/upload-srt")
 async def upload_srt(
     video_id: str = Form(..., description="e.g. tt1234567"),
     video_type: str = Form("movie"),
+    season: Optional[int] = Form(None),
+    episode: Optional[int] = Form(None),
     release_name: Optional[str] = Form(None),
     srt_file: UploadFile = File(...),
 ) -> JSONResponse:
@@ -964,6 +1242,8 @@ async def upload_srt(
         _store_english_srt_record(
             video_id=video_id,
             video_type=video_type,
+            season=season,
+            episode=episode,
             release_name=release_name,
             text=text,
         )
@@ -1000,6 +1280,12 @@ def provider_status() -> Dict[str, Any]:
     return provider_router.get_provider_status()
 
 
+@router.get("/companion/install-info")
+def install_info(request: Request) -> Dict[str, str]:
+    """Return the local URLs needed to install and use the addon."""
+    return _install_info(request)
+
+
 @router.get("/companion/translation-status/{record_id}")
 def translation_status(record_id: int) -> Dict[str, Any]:
     """Return translation progress and availability for one subtitle record."""
@@ -1018,6 +1304,175 @@ def translation_status(record_id: int) -> Dict[str, Any]:
     }
 
 
+@router.post("/companion/translate-background/{record_id}")
+def translate_background(record_id: int, force: bool = Query(False)) -> JSONResponse:
+    """Start a background translation job and return immediately."""
+    job = _start_background_translation(record_id, force=force)
+    return JSONResponse(
+        {
+            "job_id": job.get("job_id"),
+            "record_id": record_id,
+            "status": job.get("status"),
+        }
+    )
+
+
+@router.get("/companion/job-status/{job_id}")
+def job_status(job_id: str) -> Dict[str, Any]:
+    """Return the latest state for one background translation job."""
+    job = job_manager.get_job_status(job_id, config.DB_PATH)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"No background job with id={job_id}")
+    return job
+
+
+@router.get("/companion/diagnostics")
+def diagnostics() -> Dict[str, Any]:
+    """Return local readiness diagnostics for common Stremio issues."""
+    python_app_import_ok = False
+    try:
+        import_module("backend.main")
+        python_app_import_ok = True
+    except Exception:
+        python_app_import_ok = False
+
+    manifest = build_manifest()
+    manifest_ok = all(
+        key in manifest for key in ("id", "version", "name", "resources", "types")
+    )
+    subtitles_route_ok = any(
+        getattr(route, "path", "") == "/subtitles/{video_type}/{video_id}.json"
+        for route in subtitles_router.routes
+    )
+    try:
+        status_subtitle_ready = "-->" in build_status_srt("اختبار")
+    except Exception:
+        status_subtitle_ready = False
+    try:
+        parsed = parse_stremio_video_id("tt1234567:1:5")
+        stremio_id_parser_ready = (
+            parsed.get("imdb_id") == "tt1234567"
+            and parsed.get("season") == 1
+            and parsed.get("episode") == 5
+            and parsed.get("canonical_video_key") == "tt1234567:s01e05"
+            and parsed.get("is_episode") is True
+        )
+    except Exception:
+        stremio_id_parser_ready = False
+    return {
+        "python_app_import_ok": python_app_import_ok,
+        "cache_db_ready": _cache_db_ready(),
+        "cache_english_dir_ready": _cache_dirs_ready() and config.ENGLISH_CACHE_DIR.exists(),
+        "cache_arabic_dir_ready": _cache_dirs_ready() and config.ARABIC_CACHE_DIR.exists(),
+        "sample_arabic_exists": config.SAMPLE_SRT_PATH.exists(),
+        "gemini_configured": bool(get_gemini_status().get("configured")),
+        "subdl_configured": bool(subdl_service.get_status().get("configured")),
+        "subsource_configured": bool(subsource_service.get_status().get("configured")),
+        "manifest_ok": manifest_ok,
+        "subtitles_route_ok": subtitles_route_ok,
+        "active_translation_jobs": job_manager.active_job_count(),
+        "job_manager_ready": job_manager.is_ready(),
+        "status_subtitle_ready": status_subtitle_ready,
+        "stremio_id_parser_ready": stremio_id_parser_ready,
+    }
+
+
+@router.post("/companion/test-gemini")
+def test_gemini() -> JSONResponse:
+    """Run a tiny Gemini smoke test when configured."""
+    status = get_gemini_status()
+    if not status.get("configured"):
+        return JSONResponse(
+            {
+                "configured": False,
+                "success": False,
+                "message": status.get("message"),
+            }
+        )
+
+    try:
+        reply = gemini_service.generate(
+            'Translate "Hello" to Arabic. Return only the Arabic word.'
+        )
+    except GeminiError as exc:
+        return JSONResponse(
+            {
+                "configured": True,
+                "success": False,
+                "message": str(exc),
+            },
+            status_code=502,
+        )
+
+    return JSONResponse(
+        {
+            "configured": True,
+            "success": True,
+            "reply": str(reply).strip(),
+        }
+    )
+
+
+@router.post("/companion/self-test")
+def self_test() -> Dict[str, Any]:
+    """Run a safe local self-test without calling Gemini by default."""
+    db_ready = _cache_db_ready()
+    dirs_ready = _cache_dirs_ready()
+    temp_video_id = "selftest-{0}".format(uuid.uuid4().hex[:10])
+    record_id: Optional[int] = None
+    english_path: Optional[Path] = None
+    cleanup_performed = False
+    report: Dict[str, Any] = {
+        "db_ready": db_ready,
+        "cache_dirs_ready": dirs_ready,
+        "created_record": False,
+        "translation_status_ok": False,
+        "cleanup_performed": False,
+        "gemini_called": False,
+    }
+
+    try:
+        payload = _store_english_srt_record(
+            video_id=temp_video_id,
+            video_type="movie",
+            season=None,
+            episode=None,
+            release_name="Self.Test",
+            text=(
+                "1\n"
+                "00:00:01,000 --> 00:00:02,000\n"
+                "Self test line\n"
+            ),
+            source_provider="self-test",
+        )
+        record_id = int(payload["id"])
+        english_path = Path(payload["english_srt_path"])
+        report["created_record"] = get_record(config.DB_PATH, record_id) is not None
+
+        status_payload = translation_status(record_id)
+        report["translation_status_ok"] = (
+            status_payload.get("record_id") == record_id
+            and status_payload.get("status") == "uploaded"
+            and status_payload.get("arabic_available") is False
+        )
+        report["translation_status"] = status_payload
+    finally:
+        if english_path and english_path.exists():
+            english_path.unlink()
+            cleanup_performed = True
+        if record_id is not None:
+            delete_record(config.DB_PATH, record_id)
+            cleanup_performed = True
+        report["cleanup_performed"] = cleanup_performed
+
+    report["status"] = (
+        "ok"
+        if report["db_ready"] and report["cache_dirs_ready"] and report["created_record"] and report["translation_status_ok"]
+        else "failed"
+    )
+    return report
+
+
 @router.get("/companion/search-subdl")
 def search_subdl(
     video_id: str,
@@ -1029,12 +1484,13 @@ def search_subdl(
     release_name: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
     """Search SubDL and return normalized subtitle candidates."""
+    identity = _resolve_video_identity(video_id, season=season, episode=episode)
     try:
         items = subdl_service.search_subtitles(
-            video_id=video_id,
+            video_id=identity["imdb_id"] or video_id,
             video_type=video_type,
-            season=season,
-            episode=episode,
+            season=identity["season"],
+            episode=identity["episode"],
             query=query,
             language=language,
             release_name=release_name,
@@ -1057,12 +1513,13 @@ def search_subsource(
     release_name: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
     """Search SubSource and return normalized subtitle candidates."""
+    identity = _resolve_video_identity(video_id, season=season, episode=episode)
     try:
         items = subsource_service.search_subtitles(
-            video_id=video_id,
+            video_id=identity["imdb_id"] or video_id,
             video_type=video_type,
-            season=season,
-            episode=episode,
+            season=identity["season"],
+            episode=identity["episode"],
             query=query,
             language=language,
             release_name=release_name,
@@ -1087,12 +1544,13 @@ def search_all(
     """Search all configured providers and return ranked combined results."""
     if not video_id or not video_id.strip():
         raise HTTPException(status_code=400, detail="video_id is required")
+    identity = _resolve_video_identity(video_id, season=season, episode=episode)
 
     return provider_router.search_all_subtitles(
-        video_id=video_id,
+        video_id=identity["imdb_id"] or video_id,
         video_type=video_type,
-        season=season,
-        episode=episode,
+        season=identity["season"],
+        episode=identity["episode"],
         query=query,
         language=language,
         release_name=release_name,
@@ -1112,6 +1570,8 @@ async def import_subdl(request: Request) -> JSONResponse:
         _import_provider_item(
             video_id=str(payload["video_id"]),
             video_type=str(payload["video_type"]),
+            season=payload["season"],
+            episode=payload["episode"],
             release_name=payload["release_name"],
             provider=PROVIDER_SUBDL,
             subtitle_id=payload["subtitle_id"],
@@ -1133,6 +1593,8 @@ async def import_subsource(request: Request) -> JSONResponse:
         _import_provider_item(
             video_id=str(payload["video_id"]),
             video_type=str(payload["video_type"]),
+            season=payload["season"],
+            episode=payload["episode"],
             release_name=payload["release_name"],
             provider=PROVIDER_SUBSOURCE,
             subtitle_id=payload["subtitle_id"],
@@ -1147,12 +1609,17 @@ async def import_best(request: Request) -> JSONResponse:
     payload = _parse_import_best_payload(await _read_request_payload(request))
     if not payload["video_id"]:
         raise HTTPException(status_code=400, detail="video_id is required")
-
-    search_result = provider_router.search_all_subtitles(
-        video_id=payload["video_id"],
-        video_type=payload["video_type"],
+    identity = _resolve_video_identity(
+        payload["video_id"],
         season=payload["season"],
         episode=payload["episode"],
+    )
+
+    search_result = provider_router.search_all_subtitles(
+        video_id=identity["imdb_id"] or payload["video_id"],
+        video_type=payload["video_type"],
+        season=identity["season"],
+        episode=identity["episode"],
         query=payload["query"],
         language=payload["language"],
         release_name=payload["release_name"],
@@ -1171,6 +1638,8 @@ async def import_best(request: Request) -> JSONResponse:
     stored = _import_provider_item(
         video_id=payload["video_id"],
         video_type=payload["video_type"],
+        season=identity["season"],
+        episode=identity["episode"],
         release_name=release_name,
         provider=str(best.get("provider") or ""),
         subtitle_id=_parse_optional_text(best.get("subtitle_id")),
@@ -1179,13 +1648,22 @@ async def import_best(request: Request) -> JSONResponse:
 
     status = stored["status"]
     arabic_srt_path = stored["arabic_srt_path"]
+    job_id = None
     if payload["auto_translate"] and get_gemini_status().get("configured"):
-        translated = _translate_record_or_raise(
-            int(stored["id"]),
-            force=bool(payload["force_translate"]),
-        )
-        status = translated.get("status") or status
-        arabic_srt_path = translated.get("arabic_srt_path")
+        if payload["background_translate"]:
+            job = _start_background_translation(
+                int(stored["id"]),
+                force=bool(payload["force_translate"]),
+            )
+            status = job.get("status") or status
+            job_id = job.get("job_id")
+        else:
+            translated = _translate_record_or_raise(
+                int(stored["id"]),
+                force=bool(payload["force_translate"]),
+            )
+            status = translated.get("status") or status
+            arabic_srt_path = translated.get("arabic_srt_path")
 
     return JSONResponse(
         {
@@ -1194,6 +1672,7 @@ async def import_best(request: Request) -> JSONResponse:
             "score": best.get("score"),
             "status": status,
             "arabic_srt_path": arabic_srt_path,
+            "job_id": job_id,
         }
     )
 

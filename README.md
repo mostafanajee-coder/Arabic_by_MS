@@ -26,6 +26,22 @@ A FastAPI Stremio subtitle addon that serves Arabic subtitles.
   are translated in validated chunks with per-record progress tracking, safer
   retry behavior, cleanup of stray Gemini formatting, and Arabic SRT quality
   checks before the translated file is saved.
+* **Phase 9** — local Stremio integration hardening. The addon now exposes
+  `/health`, install info, diagnostics, a safe self-test, an optional tiny
+  Gemini smoke test, and request-aware subtitle URLs so local installs match
+  the actual host and port Stremio is using.
+* **Phase 10** — background translation jobs. Long Gemini translations can be
+  queued to run in the background, polled live from the companion page, and
+  safely deduplicated per record so local use remains practical.
+* **Phase 11** — production-ready Stremio subtitle response behavior. The
+  addon now returns a real cached Arabic subtitle only when one actually
+  exists. Otherwise it returns an honest generated `Arabic by M.S - Status`
+  subtitle that tells the user whether they need to upload, translate, retry,
+  or wait for a running background job.
+* **Phase 12** — episode-aware Stremio identity and canonical matching. The
+  addon now parses both `tt1234567` and `tt1234567:1:5`, stores canonical
+  video identity in SQLite, and only returns cached Arabic subtitles for the
+  exact movie or episode that was translated/imported.
 
 Nvidia and OpenSubtitles are **not** wired up yet.
 SubDL and SubSource are the currently supported external search/import providers.
@@ -39,13 +55,15 @@ Arabic_by_MS/
 │   ├── main.py
 │   ├── manifest.py
 │   ├── config.py
+│   ├── routes_status.py      # /status-subtitle/{video_id}.srt
 │   ├── routes_subtitles.py   # cache-first /subtitles/{type}/{id}.json
-│   ├── routes_download.py    # /download/{id}.srt (cached arabic or sample)
+│   ├── routes_download.py    # /download/{id}.srt (cached arabic or sample/demo)
 │   └── routes_companion.py   # /companion (HTML) + upload + list + translate
 ├── services/
 │   ├── __init__.py
 │   ├── cache_db.py            # SQLite metadata
 │   ├── gemini_service.py      # Gemini REST client (env-driven)
+│   ├── job_manager.py         # Local background translation jobs
 │   ├── provider_router.py     # Unified SubDL + SubSource router
 │   ├── subdl_service.py       # SubDL search/import provider
 │   ├── subsource_service.py   # SubSource search/import provider
@@ -57,6 +75,8 @@ Arabic_by_MS/
 │   ├── srt_chunker.py         # Parse / render / chunk SRT
 │   ├── srt_cleaner.py         # Parse Gemini's numbered replies
 │   ├── srt_quality.py         # Arabic translation cleanup + validation
+│   ├── stremio_id.py          # Parse Stremio movie / episode ids safely
+│   ├── status_srt.py          # Generated Stremio-facing status subtitles
 │   └── subtitle_matcher.py    # Provider result scoring / ranking
 ├── cache/
 │   ├── arabic/sample_arabic.srt
@@ -71,7 +91,10 @@ Arabic_by_MS/
 │   ├── test_translation.py    # Phase 3 mocked Gemini translation
 │   ├── test_subdl.py          # Phase 5 mocked SubDL search/import
 │   ├── test_subsource.py      # Phase 6 mocked SubSource search/import
-│   └── test_phase7_provider_router.py  # Phase 7 unified router/import-best
+│   ├── test_phase7_provider_router.py  # Phase 7 unified router/import-best
+│   ├── test_phase9_local_integration.py # Phase 9 local health/install/diagnostics
+│   ├── test_phase10_background_jobs.py # Phase 10 background job polling
+│   └── test_phase12_episode_identity.py # Phase 12 episode-aware matching
 ├── requirements.txt
 ├── run.bat
 ├── .env.example
@@ -106,12 +129,16 @@ uvicorn backend.main:app --reload --port 8787
 | --------------------------------------------- | --------------------------------------------- |
 | `GET /`                                       | Friendly landing                              |
 | `GET /manifest.json`                          | Stremio manifest                              |
-| `GET /subtitles/{type}/{id}.json`             | Cache-first Arabic lookup, sample fallback    |
-| `GET /download/{id}.srt`                      | Serves cached Arabic or the bundled sample    |
+| `GET /subtitles/{type}/{id}.json`             | Real Arabic when cached, otherwise a status subtitle |
+| `GET /status-subtitle/{video_id}.srt`         | Generated Arabic status SRT for Stremio       |
+| `GET /download/{id}.srt`                      | Serves cached Arabic or the bundled sample/demo file |
+| `GET /health`                                 | App + local cache/DB readiness                |
 | `GET /companion`                              | HTML page: upload + provider search + translate |
 | `POST /companion/upload-srt`                  | Upload an English `.srt`                      |
 | `GET /companion/list`                         | JSON list of every uploaded record            |
+| `GET /companion/install-info`                 | Local manifest / companion URLs for Stremio install |
 | `GET /companion/provider-status`              | Combined Gemini + provider configuration status |
+| `GET /companion/diagnostics`                  | Local diagnostics for common setup issues     |
 | `GET /companion/subdl-status`                 | SubDL configuration status                    |
 | `GET /companion/search-subdl`                 | Search SubDL for English subtitles            |
 | `POST /companion/import-subdl`                | Import a SubDL subtitle into the local cache  |
@@ -121,7 +148,23 @@ uvicorn backend.main:app --reload --port 8787
 | `GET /companion/search-all`                   | Search SubDL + SubSource together             |
 | `POST /companion/import-best`                 | Import the highest-ranked English subtitle and optionally auto-translate it |
 | `POST /companion/translate/{record_id}`       | Translate that record's English SRT to Arabic |
+| `POST /companion/translate-background/{record_id}` | Queue a background translation job        |
 | `GET /companion/translation-status/{record_id}` | Translation progress / error state for one record |
+| `GET /companion/job-status/{job_id}`          | Background translation job status + progress |
+| `POST /companion/test-gemini`                 | Optional tiny Gemini smoke test               |
+| `POST /companion/self-test`                   | Safe local DB/cache/translation-status self-test |
+
+## Supported Stremio IDs
+
+The addon now understands these Stremio video-id shapes:
+
+* `tt1234567` for movies
+* `tt1234567:1:5` for series episodes
+
+Canonical cache keys are stored as:
+
+* movie: `tt1234567`
+* episode: `tt1234567:s01e05`
 
 ## Installing the addon in Stremio
 
@@ -130,6 +173,15 @@ uvicorn backend.main:app --reload --port 8787
 3. Go to **Add-ons → Community add-ons → Install via URL**.
 4. Paste `http://127.0.0.1:8787/manifest.json` and click **Install**.
 5. Play any movie or episode and open the subtitle picker.
+
+For many local Windows setups, `http://localhost:8787/manifest.json` also
+works. Phase 9 adds `GET /companion/install-info`, which shows the exact
+manifest URL and companion URL for the host/port you are currently using.
+Phase 11 also makes the Stremio-facing behavior honest: if no translated
+Arabic file is cached yet, Stremio will show `Arabic by M.S - Status` until
+the real Arabic subtitle is ready. Phase 12 adds exact movie/episode matching,
+so `/subtitles/movie/tt1234567.json` and `/subtitles/series/tt1234567:1:5.json`
+resolve independently.
 
 > If Stremio runs on another device, replace `127.0.0.1` with your LAN IP
 > (or a tunnel URL) and set `PUBLIC_BASE_URL` in `.env` accordingly.
@@ -165,6 +217,8 @@ page during translation. Existing translated files are reused unless
 6. Use **Search All Providers** to hit both providers together, or click
    **Import Best** to store the highest-ranked English SRT immediately. If
    Gemini is configured, the same form can auto-translate it after import.
+7. For series, you can pass either `video_id=tt1234567:1:5` or
+   `video_id=tt1234567` together with `season=1` and `episode=5`.
 
 ## Running the tests
 

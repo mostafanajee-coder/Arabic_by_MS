@@ -418,6 +418,16 @@ def cancel_batch(batch_id: str, db_path: PathLike) -> Optional[Dict[str, Any]]:
 
     now = _utcnow_iso()
     with _connect(db_path) as conn:
+        running_row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM batch_prepare_items
+            WHERE batch_id = ?
+              AND status = ?
+            """,
+            (batch_id, STATUS_RUNNING),
+        ).fetchone()
+        running_items = int(running_row[0] or 0)
         conn.execute(
             """
             UPDATE batch_prepare_items
@@ -434,7 +444,12 @@ def cancel_batch(batch_id: str, db_path: PathLike) -> Optional[Dict[str, Any]]:
             SET status = ?, updated_at = ?, error_message = ?
             WHERE batch_id = ?
             """,
-            (STATUS_CANCELLED, now, "Batch cancelled by user.", batch_id),
+            (
+                STATUS_CANCELLED if running_items == 0 else STATUS_RUNNING,
+                now,
+                "Batch cancelled by user.",
+                batch_id,
+            ),
         )
         conn.commit()
 

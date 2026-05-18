@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-from services import cache_db, job_manager, provider_router, usage_guard
+from services import cache_db, job_manager, provider_import_history, provider_router, usage_guard
 from services.gemini_service import get_status as get_gemini_status
 from utils.hash_utils import sha256_text
 from utils.stremio_id import parse_stremio_video_id
@@ -420,9 +420,18 @@ def _perform_prepare(
             message=provider_error_summary or "No English subtitle results were found for this title.",
         )
 
-    best = dict(items[0])
-    download_url = str(best.get("download_url") or "").strip()
-    if not download_url:
+    selection = provider_router.import_best_with_quality_fallback(
+        items,
+        expected_language=language,
+        db_path=str(db_path),
+        legacy_video_id=video_id,
+        canonical_video_key=canonical_video_key,
+        season=season,
+        episode=episode,
+    )
+    best = dict(selection.get("selected_item") or {})
+    inspected = selection.get("selected_quality") or {}
+    if not best:
         return _result(
             status="no_results",
             canonical_video_key=canonical_video_key,
@@ -430,28 +439,58 @@ def _perform_prepare(
             job_id=None,
             provider=None,
             score=None,
-            message="The best subtitle result did not include a usable download URL.",
+            message=(
+                selection.get("fallback_reason")
+                or "Ranked subtitle results were found, but none could be safely imported."
+            ),
         )
 
-    inspected = provider_router.download_and_analyze_subtitle(
-        str(best.get("provider") or ""),
-        download_url,
-        expected_language=language,
-        strict_quality=False,
-    )
-    record_id = _store_imported_record(
-        db_path=db_path,
-        english_cache_dir=english_cache_dir,
-        video_id=video_id,
-        video_type=video_type,
-        season=season,
-        episode=episode,
-        release_name=_normalize_optional_text(best.get("release_name")) or release_name,
-        text=str(inspected["text"]),
-        source_provider=_normalize_optional_text(best.get("provider")),
-        source_subtitle_id=_normalize_optional_text(best.get("subtitle_id")),
-        source_download_url=download_url,
-    )
+    resolved_release_name = _normalize_optional_text(best.get("release_name")) or release_name
+    download_url = str(best.get("download_url") or "").strip()
+    if selection.get("reused_existing_record") and (selection.get("selected_import_history") or {}).get("record_id"):
+        imported = _reuse_existing_imported_record(
+            db_path=db_path,
+            video_id=video_id,
+            canonical_video_key=canonical_video_key,
+            season=season,
+            episode=episode,
+            source_provider=_normalize_optional_text(best.get("provider")),
+            source_subtitle_id=_normalize_optional_text(best.get("subtitle_id")),
+            source_download_url=download_url,
+            release_name=resolved_release_name,
+            record_id=int((selection.get("selected_import_history") or {})["record_id"]),
+            quality_metadata=inspected if inspected else None,
+        )
+    else:
+        if "text" not in inspected:
+            return _result(
+                status="no_results",
+                canonical_video_key=canonical_video_key,
+                record_id=None,
+                job_id=None,
+                provider=None,
+                score=None,
+                message=(
+                    selection.get("fallback_reason")
+                    or "Ranked subtitle results were found, but none could be safely imported."
+                ),
+            )
+        imported = _reuse_or_store_imported_record(
+            db_path=db_path,
+            english_cache_dir=english_cache_dir,
+            video_id=video_id,
+            video_type=video_type,
+            canonical_video_key=canonical_video_key,
+            season=season,
+            episode=episode,
+            release_name=resolved_release_name,
+            text=str(inspected["text"]),
+            source_provider=_normalize_optional_text(best.get("provider")),
+            source_subtitle_id=_normalize_optional_text(best.get("subtitle_id")),
+            source_download_url=download_url,
+            quality_metadata=inspected,
+        )
+    record_id = int(imported["record_id"])
     translation_job = job_manager.start_translation_job(
         record_id=record_id,
         force=force,
@@ -474,17 +513,40 @@ def _perform_prepare(
         provider=str(best.get("provider") or ""),
         score=best.get("score"),
         message=(
-            str(inspected.get("quality_message"))
-            if inspected.get("quality_level") == "bad" and inspected.get("quality_message")
+            "Cached English subtitle reused and background Arabic translation started."
+            if imported.get("reused_existing_record")
             else "Best English subtitle imported and background Arabic translation started."
         ),
         quality_metadata=inspected,
     )
+    result["selected_reason"] = provider_router.describe_selected_item(
+        list(selection.get("remaining_ranked_items") or [best]),
+        quarantine_note=_merge_selection_notes(
+            selection.get("quarantine_note"),
+            selection.get("import_history_note")
+            or (
+                "This exact provider subtitle was already imported for this title, so the cached record was reused."
+                if imported.get("reused_existing_record")
+                else None
+            ),
+        ),
+    )
+    result["tried_candidates"] = selection.get("tried_candidates") or []
+    result["fallback_reason"] = selection.get("fallback_reason")
+    result["quarantine"] = selection.get("selected_quarantine")
+    result["quarantine_affected_selection"] = bool(selection.get("quarantine_affected_selection"))
+    result["import_history"] = imported.get("import_history") or selection.get("selected_import_history")
+    result["reused_existing_record"] = bool(imported.get("reused_existing_record"))
+    result["import_history_note"] = selection.get("import_history_note")
+    if selection.get("fallback_reason"):
+        result["message"] += " " + str(selection["fallback_reason"])
     if inspected.get("quality_level") == "bad" and inspected.get("quality_message"):
         result["message"] = (
             "Best English subtitle imported and background Arabic translation started. "
             + str(inspected["quality_message"])
         )
+        if selection.get("fallback_reason"):
+            result["message"] += " " + str(selection["fallback_reason"])
     _clear_active_prepare(canonical_video_key)
     return result
 
@@ -536,6 +598,126 @@ def _store_imported_record(
         details={"video_id": video_id, "video_type": video_type},
     )
     return record_id
+
+
+def _reuse_or_store_imported_record(
+    *,
+    db_path: PathLike,
+    english_cache_dir: PathLike,
+    video_id: str,
+    video_type: str,
+    canonical_video_key: str,
+    season: Optional[int],
+    episode: Optional[int],
+    release_name: Optional[str],
+    text: str,
+    source_provider: Optional[str],
+    source_subtitle_id: Optional[str],
+    source_download_url: Optional[str],
+    quality_metadata: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    import_history = provider_import_history.get_candidate_summary(
+        db_path,
+        provider=source_provider,
+        subtitle_id=source_subtitle_id,
+        download_url=source_download_url,
+        release_name=release_name,
+        video_identity=canonical_video_key or video_id,
+        season=season,
+        episode=episode,
+        legacy_video_id=video_id,
+        canonical_video_key=canonical_video_key,
+    )
+    existing_record = None
+    if import_history.get("record_id"):
+        existing_record = cache_db.get_record(db_path, int(import_history["record_id"]))
+    if existing_record:
+        updated_history = provider_import_history.record_import(
+            db_path,
+            provider=source_provider,
+            subtitle_id=source_subtitle_id,
+            download_url=source_download_url,
+            release_name=release_name,
+            video_identity=canonical_video_key or video_id,
+            season=season,
+            episode=episode,
+            record_id=int(existing_record["id"]),
+            quality_level=(quality_metadata or {}).get("quality_level"),
+            quality_score=(quality_metadata or {}).get("quality_score"),
+        )
+        return {
+            "record_id": int(existing_record["id"]),
+            "import_history": updated_history,
+            "reused_existing_record": True,
+        }
+    record_id = _store_imported_record(
+        db_path=db_path,
+        english_cache_dir=english_cache_dir,
+        video_id=video_id,
+        video_type=video_type,
+        season=season,
+        episode=episode,
+        release_name=release_name,
+        text=text,
+        source_provider=source_provider,
+        source_subtitle_id=source_subtitle_id,
+        source_download_url=source_download_url,
+    )
+    updated_history = provider_import_history.record_import(
+        db_path,
+        provider=source_provider,
+        subtitle_id=source_subtitle_id,
+        download_url=source_download_url,
+        release_name=release_name,
+        video_identity=canonical_video_key or video_id,
+        season=season,
+        episode=episode,
+        record_id=record_id,
+        quality_level=(quality_metadata or {}).get("quality_level"),
+        quality_score=(quality_metadata or {}).get("quality_score"),
+    )
+    return {
+        "record_id": record_id,
+        "import_history": updated_history,
+        "reused_existing_record": False,
+    }
+
+
+def _reuse_existing_imported_record(
+    *,
+    db_path: PathLike,
+    video_id: str,
+    canonical_video_key: str,
+    season: Optional[int],
+    episode: Optional[int],
+    source_provider: Optional[str],
+    source_subtitle_id: Optional[str],
+    source_download_url: Optional[str],
+    release_name: Optional[str],
+    record_id: int,
+    quality_metadata: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    existing_record = cache_db.get_record(db_path, int(record_id))
+    if not existing_record:
+        raise ValueError("No cached subtitle record with id={0}".format(record_id))
+    updated_history = provider_import_history.record_import(
+        db_path,
+        provider=source_provider,
+        subtitle_id=source_subtitle_id,
+        download_url=source_download_url,
+        release_name=release_name,
+        video_identity=canonical_video_key or video_id,
+        season=season,
+        episode=episode,
+        record_id=int(existing_record["id"]),
+        quality_level=(quality_metadata or {}).get("quality_level"),
+        quality_score=(quality_metadata or {}).get("quality_score"),
+    )
+    return {
+        "record_id": int(existing_record["id"]),
+        "import_history": updated_history,
+        "reused_existing_record": True,
+    }
 
 
 def _running_translation_for_video(
@@ -614,6 +796,13 @@ def _normalize_optional_text(value: Any) -> Optional[str]:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _merge_selection_notes(*notes: Optional[str]) -> Optional[str]:
+    parts = [str(item).strip() for item in notes if str(item or "").strip()]
+    if not parts:
+        return None
+    return " ".join(parts)
 
 
 def _slug_video_id(video_id: str) -> str:

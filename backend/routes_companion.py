@@ -20,7 +20,9 @@ from services import (
     gemini_service,
     job_manager,
     opensubtitles_service,
+    provider_import_history,
     prepare_service,
+    provider_quarantine,
     provider_router,
     subdl_service,
     subsource_service,
@@ -138,6 +140,10 @@ _COMPANION_HTML = """<!doctype html>
 
   <div class="section">
     <h2>Provider Diagnostics</h2>
+    <div class="actions">
+      <button type="button" id="clear-quarantine-btn" class="secondary">Clear quarantine</button>
+      <button type="button" id="clear-import-history-btn" class="secondary">Clear import history</button>
+    </div>
     <div id="provider-diagnostics-panel" class="status-panel msg note">Loading provider diagnostics...</div>
     <div id="provider-error-log" class="empty">No recent provider issues.</div>
   </div>
@@ -608,6 +614,53 @@ _COMPANION_HTML = """<!doctype html>
         "<div class='msg err'><strong>Warning:</strong> " + escapeHtml(String(warningText)) + "</div>";
     }
 
+    function triedCandidateReasonLabel(reason) {
+      const normalized = String(reason || "").toLowerCase();
+      if (normalized === "invalid_srt") return "invalid SRT";
+      if (normalized === "bad_quality") return "bad quality";
+      if (normalized === "missing_url") return "missing URL";
+      if (normalized === "provider_error") return "provider error";
+      return normalized ? normalized.replaceAll("_", " ") : "";
+    }
+
+    function renderTriedCandidates(data) {
+      const tried = Array.isArray((data || {}).tried_candidates) ? data.tried_candidates : [];
+      if (!tried.length) {
+        return "";
+      }
+      const fallbackReason = data && data.fallback_reason
+        ? "<div><strong>Fallback:</strong> " + escapeHtml(String(data.fallback_reason)) + "</div>"
+        : "";
+      const rows = tried.map(item => {
+        const qualityWarnings = Array.isArray(item.quality_warnings) ? item.quality_warnings : [];
+        const status = String(item.status || "");
+        const reason = status === "selected" || status === "selected_with_warning"
+          ? (status === "selected_with_warning" ? "selected with warning" : "selected")
+          : triedCandidateReasonLabel(item.skip_reason) || "skipped";
+        const message = item.skip_message
+          || (item.provider_error && item.provider_error.message)
+          || "";
+        const qualityCell = item.quality_level
+          ? "<span class='badge " + qualityBadgeClass(String(item.quality_level || "")) + "'>" + escapeHtml(String(item.quality_level || "")) + "</span>" +
+            " " + escapeHtml(String(item.quality_score ?? "")) + "/100" +
+            (qualityWarnings.length ? "<br />" + qualityWarnings.slice(0, 2).map(text => escapeHtml(String(text))).join("<br />") : "")
+          : "";
+        return "<tr>" +
+          "<td>" + escapeHtml(String(item.rank || "")) + "</td>" +
+          "<td>" + escapeHtml(providerLabel(item.provider || "")) + "</td>" +
+          "<td>" + escapeHtml(String(item.release_name || item.subtitle_id || "")) + "</td>" +
+          "<td>" + escapeHtml(String(reason || "")) + "</td>" +
+          "<td>" + qualityCell + "</td>" +
+          "<td>" + escapeHtml(String(message || "")) + "</td>" +
+          "</tr>";
+      }).join("");
+      return "<div class='msg note'><strong>Tried candidates</strong>" +
+        fallbackReason +
+        "<table><thead><tr><th>#</th><th>Provider</th><th>Release / ID</th><th>Outcome</th><th>Quality</th><th>Note</th></tr></thead><tbody>" +
+        rows +
+        "</tbody></table></div>";
+    }
+
     function renderRecentProviderErrors() {
       const node = document.getElementById("provider-error-log");
       if (!window._recentProviderErrors || window._recentProviderErrors.length === 0) {
@@ -642,6 +695,10 @@ _COMPANION_HTML = """<!doctype html>
       const searches = counters.provider_searches_today || {};
       const imports = counters.provider_imports_today || {};
       const reliability = data.reliability || {};
+      const quarantine = data.quarantine || {};
+      const quarantineItems = Array.isArray(quarantine.items) ? quarantine.items : [];
+      const importHistory = data.import_history || {};
+      const importHistoryItems = Array.isArray(importHistory.items) ? importHistory.items : [];
       const providerNames = ["gemini", "subdl", "subsource", "opensubtitles"];
       const rows = providerNames.map(name => {
         const status = providers[name] || {};
@@ -656,6 +713,32 @@ _COMPANION_HTML = """<!doctype html>
           "</tr>";
       }).join("");
       const retrySettings = reliability.retries || {};
+      const quarantineHtml = quarantineItems.length
+        ? "<div class='summary'><strong>Provider Quarantine</strong><table><thead><tr><th>Provider</th><th>Release</th><th>Reason</th><th>Fails</th><th>Last Seen (UTC)</th></tr></thead><tbody>" +
+          quarantineItems.map(item =>
+            "<tr>" +
+            "<td>" + escapeHtml(providerLabel(item.provider || "")) + "</td>" +
+            "<td>" + escapeHtml(String(item.release_name || item.subtitle_id || "")) + "</td>" +
+            "<td>" + escapeHtml(triedCandidateReasonLabel(item.reason || "")) + "</td>" +
+            "<td>" + escapeHtml(String(item.fail_count || 0)) + "</td>" +
+            "<td>" + escapeHtml(String(item.last_seen || "")) + "</td>" +
+            "</tr>"
+          ).join("") +
+          "</tbody></table></div>"
+        : "<div class='summary'><strong>Provider Quarantine</strong>: no remembered bad candidates.</div>";
+      const importHistoryHtml = importHistoryItems.length
+        ? "<div class='summary'><strong>Provider Import History</strong><table><thead><tr><th>Provider</th><th>Release</th><th>Video Identity</th><th>Imports</th><th>Last Imported (UTC)</th></tr></thead><tbody>" +
+          importHistoryItems.map(item =>
+            "<tr>" +
+            "<td>" + escapeHtml(providerLabel(item.provider || "")) + "</td>" +
+            "<td>" + escapeHtml(String(item.release_name || item.subtitle_id || "")) + "</td>" +
+            "<td><code>" + escapeHtml(String(item.video_identity || "")) + "</code></td>" +
+            "<td>" + escapeHtml(String(item.import_count || 0)) + "</td>" +
+            "<td>" + escapeHtml(String(item.last_imported_at || "")) + "</td>" +
+            "</tr>"
+          ).join("") +
+          "</tbody></table></div>"
+        : "<div class='summary'><strong>Provider Import History</strong>: no remembered imports yet.</div>";
       node.className = "status-panel msg note";
       node.innerHTML = "<table><thead><tr><th>Provider</th><th>Status</th><th>Searches Today</th><th>Imports Today</th><th>Recent / Current Note</th></tr></thead><tbody>" +
         rows +
@@ -663,8 +746,52 @@ _COMPANION_HTML = """<!doctype html>
         "<div class='summary'><strong>Retry settings:</strong> retries=" + escapeHtml(String(retrySettings.max_retries || 0)) +
         " | retryable HTTP=" + escapeHtml(String((retrySettings.retryable_http_statuses || []).join(", "))) +
         " | default search timeout=" + escapeHtml(String(retrySettings.default_search_timeout_seconds || "")) + "s" +
-        " | default download timeout=" + escapeHtml(String(retrySettings.default_download_timeout_seconds || "")) + "s</div>";
+        " | default download timeout=" + escapeHtml(String(retrySettings.default_download_timeout_seconds || "")) + "s</div>" +
+        quarantineHtml +
+        importHistoryHtml;
       renderRecentProviderErrors();
+    }
+
+    async function clearProviderQuarantine(btn) {
+      const original = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Clearing...";
+      try {
+        const res = await fetch("/companion/provider-quarantine/clear", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "Failed to clear provider quarantine");
+        }
+        await refreshProviderDiagnostics();
+      } catch (err) {
+        const node = document.getElementById("provider-diagnostics-panel");
+        node.className = "status-panel msg err";
+        node.textContent = "Failed to clear provider quarantine: " + err.message;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+
+    async function clearProviderImportHistory(btn) {
+      const original = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Clearing...";
+      try {
+        const res = await fetch("/companion/provider-import-history/clear", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "Failed to clear provider import history");
+        }
+        await refreshProviderDiagnostics();
+      } catch (err) {
+        const node = document.getElementById("provider-diagnostics-panel");
+        node.className = "status-panel msg err";
+        node.textContent = "Failed to clear provider import history: " + err.message;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
     }
 
     function renderUsageStatus(data) {
@@ -1675,6 +1802,14 @@ _COMPANION_HTML = """<!doctype html>
       await cancelBatch(this);
     });
 
+    document.getElementById("clear-quarantine-btn").addEventListener("click", async function () {
+      await clearProviderQuarantine(this);
+    });
+
+    document.getElementById("clear-import-history-btn").addEventListener("click", async function () {
+      await clearProviderImportHistory(this);
+    });
+
     document.getElementById("import-best-btn").addEventListener("click", async function () {
       const result = document.getElementById("search-all-result");
       result.innerHTML = "";
@@ -1696,18 +1831,20 @@ _COMPANION_HTML = """<!doctype html>
         }
         if (!res.ok) {
           rememberProviderErrors("import-best", data.provider_errors || {});
-          result.innerHTML = "<div class='msg err'>" + escapeHtml(data.detail || "Import best failed") + "</div>";
+          result.innerHTML = "<div class='msg err'>" + escapeHtml(data.detail || "Import best failed") + "</div>" +
+            renderTriedCandidates(data);
           await refreshProviderDiagnostics();
           return;
         }
         rememberProviderErrors("import-best", data.provider_errors || {});
         const translated = data.arabic_srt_path ? " translated" : "";
         const background = data.job_id ? " background job " + escapeHtml(String(data.job_id)) + "." : "";
-        result.innerHTML = "<div class='msg ok'>Imported best result from " +
+        result.innerHTML = "<div class='msg ok'>" + (data.reused_existing_record ? "Reused cached subtitle from " : "Imported best result from ") +
           escapeHtml(data.provider) + " as record #" + escapeHtml(String(data.record_id)) +
           " (" + escapeHtml(data.status) + ")" + escapeHtml(translated) + "." + background + "</div>" +
           (data.selected_reason ? "<div class='msg note'><strong>Why selected?</strong><br />" + escapeHtml(String(data.selected_reason)) + "</div>" : "") +
-          renderQualitySummary(data);
+          renderQualitySummary(data) +
+          renderTriedCandidates(data);
         await refreshList();
         await refreshUsage();
         await refreshProviderDiagnostics();
@@ -2357,6 +2494,31 @@ def _import_provider_item(
     except (SubDLError, SubSourceError, OpenSubtitlesError) as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    return _store_imported_provider_item(
+        video_id=video_id,
+        video_type=video_type,
+        season=season,
+        episode=episode,
+        release_name=release_name,
+        provider=provider,
+        subtitle_id=subtitle_id,
+        download_url=download_url,
+        inspected=inspected,
+    )
+
+
+def _store_imported_provider_item(
+    *,
+    video_id: str,
+    video_type: str,
+    season: Optional[int],
+    episode: Optional[int],
+    release_name: Optional[str],
+    provider: str,
+    subtitle_id: Optional[str],
+    download_url: str,
+    inspected: Dict[str, Any],
+) -> Dict[str, Any]:
     stored = _store_english_srt_record(
         video_id=video_id,
         video_type=video_type,
@@ -2375,7 +2537,146 @@ def _import_provider_item(
         record_id=int(stored["id"]),
         details={"video_id": video_id, "video_type": video_type},
     )
+    import_history = _record_provider_import_history(
+        video_id=video_id,
+        season=season,
+        episode=episode,
+        provider=provider,
+        subtitle_id=subtitle_id,
+        download_url=download_url,
+        release_name=release_name,
+        record_id=int(stored["id"]),
+        quality_metadata=inspected,
+    )
+    stored["import_history"] = import_history
+    stored["reused_existing_record"] = False
     return stored
+
+
+def _reuse_or_store_imported_provider_item(
+    *,
+    video_id: str,
+    video_type: str,
+    season: Optional[int],
+    episode: Optional[int],
+    release_name: Optional[str],
+    provider: str,
+    subtitle_id: Optional[str],
+    download_url: str,
+    inspected: Dict[str, Any],
+) -> Dict[str, Any]:
+    identity = _resolve_video_identity(video_id, season=season, episode=episode)
+    import_summary = provider_import_history.get_candidate_summary(
+        config.DB_PATH,
+        provider=provider,
+        subtitle_id=subtitle_id,
+        download_url=download_url,
+        release_name=release_name,
+        video_identity=_history_video_identity(identity),
+        season=identity.get("season"),
+        episode=identity.get("episode"),
+        legacy_video_id=video_id,
+        canonical_video_key=identity.get("canonical_video_key"),
+    )
+    existing_record = None
+    if import_summary.get("record_id"):
+        existing_record = get_record(config.DB_PATH, int(import_summary["record_id"]))
+    if existing_record:
+        return _reuse_existing_imported_provider_item(
+            video_id=video_id,
+            season=season,
+            episode=episode,
+            provider=provider,
+            subtitle_id=subtitle_id,
+            download_url=download_url,
+            release_name=release_name,
+            record_id=int(existing_record["id"]),
+            quality_metadata=inspected,
+        )
+    return _store_imported_provider_item(
+        video_id=video_id,
+        video_type=video_type,
+        season=season,
+        episode=episode,
+        release_name=release_name,
+        provider=provider,
+        subtitle_id=subtitle_id,
+        download_url=download_url,
+        inspected=inspected,
+    )
+
+
+def _reuse_existing_imported_provider_item(
+    *,
+    video_id: str,
+    season: Optional[int],
+    episode: Optional[int],
+    provider: str,
+    subtitle_id: Optional[str],
+    download_url: str,
+    release_name: Optional[str],
+    record_id: int,
+    quality_metadata: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    existing_record = get_record(config.DB_PATH, int(record_id))
+    if not existing_record:
+        raise HTTPException(status_code=404, detail=f"No subtitle record with id={record_id}")
+    updated_history = _record_provider_import_history(
+        video_id=video_id,
+        season=season,
+        episode=episode,
+        provider=provider,
+        subtitle_id=subtitle_id,
+        download_url=download_url,
+        release_name=release_name,
+        record_id=int(existing_record["id"]),
+        quality_metadata=quality_metadata,
+    )
+    payload = dict(existing_record)
+    if quality_metadata:
+        payload = merge_quality_metadata(payload, quality_metadata)
+    payload["import_history"] = updated_history
+    payload["reused_existing_record"] = True
+    return payload
+
+
+def _record_provider_import_history(
+    *,
+    video_id: str,
+    season: Optional[int],
+    episode: Optional[int],
+    provider: str,
+    subtitle_id: Optional[str],
+    download_url: str,
+    release_name: Optional[str],
+    record_id: int,
+    quality_metadata: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    identity = _resolve_video_identity(video_id, season=season, episode=episode)
+    return provider_import_history.record_import(
+        config.DB_PATH,
+        provider=provider,
+        subtitle_id=subtitle_id,
+        download_url=download_url,
+        release_name=release_name,
+        video_identity=_history_video_identity(identity),
+        season=identity.get("season"),
+        episode=identity.get("episode"),
+        record_id=record_id,
+        quality_level=(quality_metadata or {}).get("quality_level"),
+        quality_score=(quality_metadata or {}).get("quality_score"),
+    )
+
+
+def _history_video_identity(identity: Dict[str, Any]) -> str:
+    return str(identity.get("canonical_video_key") or identity.get("raw_video_id") or "").strip()
+
+
+def _merge_selection_notes(*notes: Optional[str]) -> Optional[str]:
+    parts = [str(item).strip() for item in notes if str(item or "").strip()]
+    if not parts:
+        return None
+    return " ".join(parts)
 
 
 def _translate_record_or_raise(record_id: int, *, force: bool) -> Dict[str, Any]:
@@ -2549,6 +2850,50 @@ def provider_diagnostics() -> Dict[str, Any]:
         "providers": provider_router.get_provider_status(),
         "provider_usage_counters": usage_guard.get_provider_usage_counters(config.DB_PATH),
         "reliability": provider_router.get_reliability_settings(),
+        "quarantine": {
+            "threshold": provider_quarantine.QUARANTINE_THRESHOLD,
+            "items": provider_quarantine.list_entries(config.DB_PATH),
+        },
+        "import_history": {
+            "items": provider_import_history.list_entries(config.DB_PATH),
+        },
+    }
+
+
+@router.get("/companion/provider-quarantine")
+def provider_quarantine_endpoint() -> Dict[str, Any]:
+    """Return recent provider quarantine memory rows."""
+    return {
+        "threshold": provider_quarantine.QUARANTINE_THRESHOLD,
+        "items": provider_quarantine.list_entries(config.DB_PATH),
+    }
+
+
+@router.post("/companion/provider-quarantine/clear")
+def clear_provider_quarantine_endpoint() -> Dict[str, Any]:
+    """Clear all locally stored provider quarantine memory."""
+    cleared_count = provider_quarantine.clear_entries(config.DB_PATH)
+    return {
+        "status": "cleared",
+        "cleared_count": cleared_count,
+    }
+
+
+@router.get("/companion/provider-import-history")
+def provider_import_history_endpoint() -> Dict[str, Any]:
+    """Return recent provider import history rows."""
+    return {
+        "items": provider_import_history.list_entries(config.DB_PATH),
+    }
+
+
+@router.post("/companion/provider-import-history/clear")
+def clear_provider_import_history_endpoint() -> Dict[str, Any]:
+    """Clear locally stored provider import history rows."""
+    cleared_count = provider_import_history.clear_entries(config.DB_PATH)
+    return {
+        "status": "cleared",
+        "cleared_count": cleared_count,
     }
 
 
@@ -3329,24 +3674,80 @@ async def import_best(request: Request) -> JSONResponse:
                 "detail": "No subtitle results found across the configured providers.",
                 "provider_errors": search_result.get("provider_errors") or {},
                 "searched_providers": search_result.get("searched_providers") or [],
+                "tried_candidates": [],
+                "fallback_reason": None,
             },
             status_code=404,
         )
 
-    best = dict(items[0])
+    selection = provider_router.import_best_with_quality_fallback(
+        items,
+        expected_language=payload["language"],
+        db_path=str(config.DB_PATH),
+        legacy_video_id=payload["video_id"],
+        canonical_video_key=identity.get("canonical_video_key"),
+        season=identity.get("season"),
+        episode=identity.get("episode"),
+    )
+    best = dict(selection.get("selected_item") or {})
+    inspected = selection.get("selected_quality") or {}
+    if not best:
+        return JSONResponse(
+            {
+                "detail": "Ranked subtitle results were found, but none could be safely imported.",
+                "provider_errors": search_result.get("provider_errors") or {},
+                "searched_providers": search_result.get("searched_providers") or [],
+                "tried_candidates": selection.get("tried_candidates") or [],
+                "fallback_reason": selection.get("fallback_reason"),
+                "quarantine": selection.get("selected_quarantine"),
+                "quarantine_affected_selection": bool(selection.get("quarantine_affected_selection")),
+            },
+            status_code=502,
+        )
     release_name = (
         _parse_optional_text(best.get("release_name")) or payload["release_name"]
     )
-    stored = _import_provider_item(
-        video_id=payload["video_id"],
-        video_type=payload["video_type"],
-        season=identity["season"],
-        episode=identity["episode"],
-        release_name=release_name,
-        provider=str(best.get("provider") or ""),
-        subtitle_id=_parse_optional_text(best.get("subtitle_id")),
-        download_url=str(best.get("download_url") or ""),
-    )
+    import_history_note = selection.get("import_history_note")
+    if selection.get("reused_existing_record") and (selection.get("selected_import_history") or {}).get("record_id"):
+        stored = _reuse_existing_imported_provider_item(
+            video_id=payload["video_id"],
+            season=identity["season"],
+            episode=identity["episode"],
+            provider=str(best.get("provider") or ""),
+            subtitle_id=_parse_optional_text(best.get("subtitle_id")),
+            download_url=str(best.get("download_url") or ""),
+            release_name=release_name,
+            record_id=int((selection.get("selected_import_history") or {})["record_id"]),
+            quality_metadata=inspected if inspected else None,
+        )
+    else:
+        if "text" not in inspected:
+            return JSONResponse(
+                {
+                    "detail": "Ranked subtitle results were found, but none could be safely imported.",
+                    "provider_errors": search_result.get("provider_errors") or {},
+                    "searched_providers": search_result.get("searched_providers") or [],
+                    "tried_candidates": selection.get("tried_candidates") or [],
+                    "fallback_reason": selection.get("fallback_reason"),
+                    "quarantine": selection.get("selected_quarantine"),
+                    "quarantine_affected_selection": bool(selection.get("quarantine_affected_selection")),
+                    "import_history": selection.get("selected_import_history"),
+                },
+                status_code=502,
+            )
+        stored = _reuse_or_store_imported_provider_item(
+            video_id=payload["video_id"],
+            video_type=payload["video_type"],
+            season=identity["season"],
+            episode=identity["episode"],
+            release_name=release_name,
+            provider=str(best.get("provider") or ""),
+            subtitle_id=_parse_optional_text(best.get("subtitle_id")),
+            download_url=str(best.get("download_url") or ""),
+            inspected=inspected,
+        )
+        if stored.get("reused_existing_record"):
+            import_history_note = "This exact provider subtitle was already imported for this title, so the cached record was reused."
 
     status = stored["status"]
     arabic_srt_path = stored["arabic_srt_path"]
@@ -3372,12 +3773,25 @@ async def import_best(request: Request) -> JSONResponse:
             "record_id": stored["id"],
             "provider": best.get("provider"),
             "score": best.get("score"),
-            "selected_reason": provider_router.describe_selected_item(items),
+            "selected_reason": provider_router.describe_selected_item(
+                list(selection.get("remaining_ranked_items") or [best]),
+                quarantine_note=_merge_selection_notes(
+                    selection.get("quarantine_note"),
+                    import_history_note,
+                ),
+            ),
             "status": status,
             "arabic_srt_path": arabic_srt_path,
             "job_id": job_id,
             "provider_errors": search_result.get("provider_errors") or {},
             "searched_providers": search_result.get("searched_providers") or [],
+            "tried_candidates": selection.get("tried_candidates") or [],
+            "fallback_reason": selection.get("fallback_reason"),
+            "quarantine": selection.get("selected_quarantine"),
+            "quarantine_affected_selection": bool(selection.get("quarantine_affected_selection")),
+            "import_history": stored.get("import_history") or selection.get("selected_import_history"),
+            "reused_existing_record": bool(stored.get("reused_existing_record")),
+            "import_history_note": import_history_note,
             "quality_score": stored.get("quality_score"),
             "quality_level": stored.get("quality_level"),
             "quality_warnings": stored.get("quality_warnings") or [],

@@ -11,7 +11,6 @@ from typing import Any, Dict, Optional, Union
 from services import cache_db, job_manager, provider_router, usage_guard
 from services.gemini_service import get_status as get_gemini_status
 from utils.hash_utils import sha256_text
-from utils.srt_validator import SRTValidationError, validate_srt_content
 from utils.stremio_id import parse_stremio_video_id
 
 PathLike = Union[str, Path]
@@ -313,6 +312,10 @@ def _start_prepare_thread(**kwargs: Any) -> Dict[str, Any]:
         "job_id": None,
         "provider": None,
         "score": None,
+        "quality_score": None,
+        "quality_level": None,
+        "quality_warnings": [],
+        "reject_hint": False,
         "message": "Preparation has started in the background.",
         "error_message": None,
         "started_at": None,
@@ -404,6 +407,9 @@ def _perform_prepare(
     )
     items = search_result.get("items") or []
     if not items:
+        provider_error_summary = provider_router.summarize_provider_errors(
+            search_result.get("provider_errors") or {}
+        )
         return _result(
             status="no_results",
             canonical_video_key=canonical_video_key,
@@ -411,7 +417,7 @@ def _perform_prepare(
             job_id=None,
             provider=None,
             score=None,
-            message="No English subtitle results were found for this title.",
+            message=provider_error_summary or "No English subtitle results were found for this title.",
         )
 
     best = dict(items[0])
@@ -427,11 +433,12 @@ def _perform_prepare(
             message="The best subtitle result did not include a usable download URL.",
         )
 
-    raw = provider_router.download_subtitle_data(
+    inspected = provider_router.download_and_analyze_subtitle(
         str(best.get("provider") or ""),
         download_url,
+        expected_language=language,
+        strict_quality=False,
     )
-    text = validate_srt_content(raw)
     record_id = _store_imported_record(
         db_path=db_path,
         english_cache_dir=english_cache_dir,
@@ -440,7 +447,7 @@ def _perform_prepare(
         season=season,
         episode=episode,
         release_name=_normalize_optional_text(best.get("release_name")) or release_name,
-        text=text,
+        text=str(inspected["text"]),
         source_provider=_normalize_optional_text(best.get("provider")),
         source_subtitle_id=_normalize_optional_text(best.get("subtitle_id")),
         source_download_url=download_url,
@@ -466,8 +473,18 @@ def _perform_prepare(
         job_id=translation_job.get("job_id"),
         provider=str(best.get("provider") or ""),
         score=best.get("score"),
-        message="Best English subtitle imported and background Arabic translation started.",
+        message=(
+            str(inspected.get("quality_message"))
+            if inspected.get("quality_level") == "bad" and inspected.get("quality_message")
+            else "Best English subtitle imported and background Arabic translation started."
+        ),
+        quality_metadata=inspected,
     )
+    if inspected.get("quality_level") == "bad" and inspected.get("quality_message"):
+        result["message"] = (
+            "Best English subtitle imported and background Arabic translation started. "
+            + str(inspected["quality_message"])
+        )
     _clear_active_prepare(canonical_video_key)
     return result
 
@@ -558,8 +575,9 @@ def _result(
     provider: Optional[str],
     score: Any,
     message: str,
+    quality_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    return {
+    result = {
         "status": status,
         "canonical_video_key": canonical_video_key,
         "record_id": record_id,
@@ -568,6 +586,27 @@ def _result(
         "score": score,
         "message": message,
     }
+    if quality_metadata:
+        result.update(
+            {
+                "quality_score": quality_metadata.get("quality_score"),
+                "quality_level": quality_metadata.get("quality_level"),
+                "quality_warnings": list(quality_metadata.get("quality_warnings") or []),
+                "reject_hint": bool(quality_metadata.get("reject_hint")),
+                "quality_message": quality_metadata.get("quality_message"),
+            }
+        )
+    else:
+        result.update(
+            {
+                "quality_score": None,
+                "quality_level": None,
+                "quality_warnings": [],
+                "reject_hint": False,
+                "quality_message": None,
+            }
+        )
+    return result
 
 
 def _normalize_optional_text(value: Any) -> Optional[str]:
@@ -618,6 +657,10 @@ def _mark_prepare_completed(prepare_id: str, result: Dict[str, Any]) -> None:
         job["job_id"] = result.get("job_id")
         job["provider"] = result.get("provider")
         job["score"] = result.get("score")
+        job["quality_score"] = result.get("quality_score")
+        job["quality_level"] = result.get("quality_level")
+        job["quality_warnings"] = list(result.get("quality_warnings") or [])
+        job["reject_hint"] = bool(result.get("reject_hint"))
         job["message"] = result.get("message")
         canonical_video_key = str(job.get("canonical_video_key") or "")
         if _ACTIVE_BY_CANONICAL.get(canonical_video_key) == prepare_id:

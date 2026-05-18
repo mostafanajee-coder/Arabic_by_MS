@@ -64,6 +64,22 @@ A FastAPI Stremio subtitle addon that serves Arabic subtitles.
   provider router now support OpenSubtitles as an optional third external
   English subtitle provider, while preserving the existing SubDL, SubSource,
   Gemini, one-click prepare, usage guard, and batch prepare workflows.
+* **Phase 18** — provider reliability hardening and transparent diagnostics.
+  Shared retry handling now protects provider search/download calls from
+  transient HTTP failures, `search-all` returns structured safe provider
+  error details, batch prepare surfaces provider-safe item errors through
+  the router, and the Companion UI exposes a minimal Provider Diagnostics
+  panel without changing the existing Phase 16/17 workflows.
+* **Phase 19** — subtitle match intelligence and transparent best-choice
+  explanations. Ranked provider results now expose score breakdowns,
+  confidence, and safe warnings, `search-all` surfaces the extra match
+  context, and `import-best` explains why the winning subtitle was chosen
+  without changing provider APIs or the Phase 18 retry/diagnostics flow.
+* **Phase 20** — subtitle quality inspection and safe auto-rejection hints.
+  Imported provider subtitles are now checked for malformed timing,
+  overlaps, repeated text, suspicious size, and likely wrong language after
+  download and before save/translate. Companion import responses and batch
+  prepare item status expose non-blocking quality metadata and warnings.
 Nvidia is **not** wired up yet.
 SubDL, SubSource, and OpenSubtitles are the currently supported external
 search/import providers.
@@ -100,7 +116,7 @@ Arabic_by_MS/
 │   ├── hash_utils.py          # SHA-256 helpers
 │   ├── srt_chunker.py         # Parse / render / chunk SRT
 │   ├── srt_cleaner.py         # Parse Gemini's numbered replies
-│   ├── srt_quality.py         # Arabic translation cleanup + validation
+│   ├── srt_quality.py         # Translation cleanup + subtitle quality analysis
 │   ├── srt_timing.py          # Safe SRT timestamp shifting helpers
 │   ├── stremio_id.py          # Parse Stremio movie / episode ids safely
 │   ├── status_srt.py          # Generated Stremio-facing status subtitles
@@ -126,7 +142,10 @@ Arabic_by_MS/
 │   ├── test_phase14_prepare_workflow.py # Phase 14 prepare workflow
 │   ├── test_phase15_usage_guard.py # Phase 15 quota safety + usage tracking
 │   ├── test_phase16_batch_prepare.py # Phase 16 batch prepare queue
-│   └── test_phase17_opensubtitles_provider.py # Phase 17 OpenSubtitles provider
+│   ├── test_phase17_opensubtitles_provider.py # Phase 17 OpenSubtitles provider
+│   ├── test_phase18_provider_reliability.py # Phase 18 provider reliability
+│   ├── test_phase19_match_intelligence.py # Phase 19 match intelligence
+│   └── test_phase20_srt_quality_gate.py   # Phase 20 subtitle quality gate
 ├── requirements.txt
 ├── run.bat
 ├── .env.example
@@ -170,6 +189,7 @@ uvicorn backend.main:app --reload --port 8787
 | `GET /companion/list`                         | JSON list of every uploaded record            |
 | `GET /companion/install-info`                 | Local manifest / companion URLs for Stremio install |
 | `GET /companion/provider-status`              | Combined Gemini + provider configuration status |
+| `GET /companion/provider-diagnostics`         | Safe provider status, retry settings, and usage counters |
 | `GET /companion/diagnostics`                  | Local diagnostics for common setup issues     |
 | `GET /companion/subdl-status`                 | SubDL configuration status                    |
 | `GET /companion/search-subdl`                 | Search SubDL for English subtitles            |
@@ -180,8 +200,8 @@ uvicorn backend.main:app --reload --port 8787
 | `GET /companion/opensubtitles-status`         | OpenSubtitles configuration status            |
 | `GET /companion/search-opensubtitles`         | Search OpenSubtitles for English subtitles    |
 | `POST /companion/import-opensubtitles`        | Import an OpenSubtitles subtitle into local cache |
-| `GET /companion/search-all`                   | Search all configured providers together      |
-| `POST /companion/import-best`                 | Import the highest-ranked English subtitle and optionally auto-translate it |
+| `GET /companion/search-all`                   | Search all configured providers together with confidence and warnings |
+| `POST /companion/import-best`                 | Import the highest-ranked English subtitle, explain why it won, expose quality warnings, and optionally auto-translate it |
 | `POST /companion/prepare`                     | Search, import, and background-translate in one action |
 | `GET /companion/prepare-status/{canonical_video_key}` | Show exact-title prepare readiness, active job, and latest error |
 | `POST /companion/batch-prepare`               | Queue a safe sequential batch prepare job for series episodes |

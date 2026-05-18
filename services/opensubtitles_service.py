@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 
+from services import provider_reliability
 from utils.subtitle_matcher import extract_release_name, sort_subtitle_matches
 
 DEFAULT_BASE_URL = "https://api.opensubtitles.com/api/v1"
@@ -32,12 +33,18 @@ def get_config() -> Tuple[str, str, str]:
     base_url = (os.getenv("OPENSUBTITLES_BASE_URL") or "").strip() or DEFAULT_BASE_URL
     missing = _missing_config_vars(api_key, user_agent)
     if missing:
-        raise OpenSubtitlesNotConfiguredError(
-            "{0} missing. Add {1} to your environment or .env file before "
-            "searching or importing from OpenSubtitles.".format(
+        raise provider_reliability.make_provider_error(
+            OpenSubtitlesNotConfiguredError,
+            provider="opensubtitles",
+            operation="config",
+            message=(
+                "{0} missing. Add {1} to your environment or .env file before "
+                "searching or importing from OpenSubtitles."
+            ).format(
                 ", ".join(missing),
                 ", ".join(missing),
-            )
+            ),
+            error_type="missing_config",
         )
     return api_key, user_agent, base_url.rstrip("/")
 
@@ -73,7 +80,7 @@ def search_subtitles(
     query: Optional[str] = None,
     language: str = "en",
     release_name: Optional[str] = None,
-    timeout: float = 30.0,
+    timeout: float = provider_reliability.DEFAULT_SEARCH_TIMEOUT,
 ) -> List[Dict[str, Any]]:
     """Search OpenSubtitles and return normalized subtitle matches sorted by score."""
     api_key, user_agent, base_url = get_config()
@@ -86,13 +93,13 @@ def search_subtitles(
             base_url,
             api_key,
             user_agent,
-            {
-                "imdb_id": _normalize_imdb_id(video_id),
-                "languages": _normalize_language(language),
-                "type": _normalize_type(video_type),
-                "season_number": season,
-                "episode_number": episode,
-            },
+            _build_id_search_params(
+                video_id=video_id,
+                video_type=video_type,
+                season=season,
+                episode=episode,
+                language=language,
+            ),
             timeout=timeout,
         )
         _append_candidates(candidates, seen_keys, response)
@@ -190,80 +197,62 @@ def normalize_result(
         "release_name": release,
         "download_url": download_url,
         "score": scored["score"],
-        "raw": raw,
+        "score_breakdown": scored["score_breakdown"],
+        "match_confidence": scored["match_confidence"],
+        "match_warnings": scored["match_warnings"],
+        "raw": _public_raw(raw),
     }
 
 
-def download_subtitle_data(download_url: str, *, timeout: float = 60.0) -> bytes:
+def download_subtitle_data(
+    download_url: str,
+    *,
+    timeout: float = provider_reliability.DEFAULT_DOWNLOAD_TIMEOUT,
+) -> bytes:
     """Download subtitle bytes from OpenSubtitles, extracting the first SRT from zips."""
     api_key, user_agent, base_url = get_config()
     if not download_url or not str(download_url).strip():
-        raise OpenSubtitlesError("OpenSubtitles download URL is missing.")
-
-    resolved_url = str(download_url).strip()
-    initial = _http_get(
-        resolved_url,
-        headers=_api_headers(api_key, user_agent),
-        timeout=timeout,
-        follow_redirects=True,
-    )
-
-    if initial.status_code != 200:
-        raise OpenSubtitlesError(
-            "OpenSubtitles download returned HTTP {0}: {1}".format(
-                initial.status_code,
-                initial.text[:200],
-            )
+        raise provider_reliability.make_provider_error(
+            OpenSubtitlesError,
+            provider="opensubtitles",
+            operation="download",
+            message="OpenSubtitles download URL is missing.",
+            error_type="bad_request",
         )
 
-    try:
-        payload = initial.json()
-    except ValueError:
-        payload = None
-
-    if isinstance(payload, dict):
-        link = _normalize_text(payload.get("link"))
-        if link:
-            binary = _http_get(link, headers={"User-Agent": user_agent}, timeout=timeout, follow_redirects=True)
-            if binary.status_code != 200:
-                raise OpenSubtitlesError(
-                    "OpenSubtitles file link returned HTTP {0}: {1}".format(
-                        binary.status_code,
-                        binary.text[:200],
-                    )
-                )
-            return _decode_download_bytes(binary.content, binary.headers.get("content-type", ""), link)
-        requested = _normalize_text(payload.get("requested_downloads")) or _normalize_text(payload.get("message"))
-        raise OpenSubtitlesError(requested or "OpenSubtitles download response did not include a link.")
-
+    resolved_url = str(download_url).strip()
+    file_id = ""
     if resolved_url.startswith(base_url + DOWNLOAD_PATH):
         file_id = _extract_file_id_from_url(resolved_url)
-        if file_id:
-            fallback = _http_get(
-                base_url + DOWNLOAD_PATH,
-                params={"file_id": file_id, "sub_format": "srt"},
-                headers=_api_headers(api_key, user_agent),
-                timeout=timeout,
-                follow_redirects=True,
-            )
-            if fallback.status_code == 200:
-                try:
-                    fallback_payload = fallback.json()
-                except ValueError:
-                    fallback_payload = None
-                if isinstance(fallback_payload, dict) and _normalize_text(fallback_payload.get("link")):
-                    link = str(fallback_payload["link"]).strip()
-                    binary = _http_get(link, headers={"User-Agent": user_agent}, timeout=timeout, follow_redirects=True)
-                    if binary.status_code != 200:
-                        raise OpenSubtitlesError(
-                            "OpenSubtitles file link returned HTTP {0}: {1}".format(
-                                binary.status_code,
-                                binary.text[:200],
-                            )
-                        )
-                    return _decode_download_bytes(binary.content, binary.headers.get("content-type", ""), link)
 
-    return _decode_download_bytes(initial.content, initial.headers.get("content-type", ""), resolved_url)
+    if file_id:
+        initial = provider_reliability.run_with_retries(
+            lambda: _request_generated_download(
+                base_url + DOWNLOAD_PATH,
+                file_id=file_id,
+                api_key=api_key,
+                user_agent=user_agent,
+                timeout=timeout,
+            ),
+        )
+    else:
+        headers = {"User-Agent": user_agent}
+        if resolved_url.startswith(base_url):
+            headers = _api_headers(api_key, user_agent)
+        initial = provider_reliability.run_with_retries(
+            lambda: _request_direct_download(
+                resolved_url,
+                headers=headers,
+                timeout=timeout,
+            ),
+        )
+
+    return _handle_download_response(
+        initial,
+        resolved_url=resolved_url,
+        user_agent=user_agent,
+        timeout=timeout,
+    )
 
 
 def _request_search(
@@ -275,28 +264,35 @@ def _request_search(
     timeout: float,
 ) -> Dict[str, Any]:
     query = {key: value for key, value in params.items() if value not in (None, "")}
-    response = _http_get(
-        base_url + SEARCH_PATH,
-        params=query,
-        headers=_api_headers(api_key, user_agent),
-        timeout=timeout,
+    response = provider_reliability.run_with_retries(
+        lambda: _request_search_response(
+            base_url + SEARCH_PATH,
+            params=query,
+            headers=_api_headers(api_key, user_agent),
+            timeout=timeout,
+        ),
     )
-    if response.status_code != 200:
-        raise OpenSubtitlesError(
-            "OpenSubtitles search returned HTTP {0}: {1}".format(
-                response.status_code,
-                response.text[:300],
-            )
-        )
     try:
         data = response.json()
     except ValueError as exc:
-        raise OpenSubtitlesError("OpenSubtitles returned invalid JSON.") from exc
+        raise provider_reliability.make_provider_error(
+            OpenSubtitlesError,
+            provider="opensubtitles",
+            operation="search",
+            message="OpenSubtitles returned invalid JSON.",
+            error_type="invalid_response",
+        ) from exc
     if isinstance(data, dict) and isinstance(data.get("data"), list):
         return data
     if isinstance(data, list):
         return {"data": data}
-    raise OpenSubtitlesError("OpenSubtitles response did not include a subtitle list.")
+    raise provider_reliability.make_provider_error(
+        OpenSubtitlesError,
+        provider="opensubtitles",
+        operation="search",
+        message="OpenSubtitles response did not include a subtitle list.",
+        error_type="invalid_response",
+    )
 
 
 def _append_candidates(
@@ -310,6 +306,25 @@ def _append_candidates(
             continue
         seen_keys.add(key)
         out.append(subtitle)
+
+
+def _build_id_search_params(
+    *,
+    video_id: str,
+    video_type: str,
+    season: Optional[int],
+    episode: Optional[int],
+    language: str,
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {
+        "languages": _normalize_language(language),
+        "type": _normalize_type(video_type),
+        "season_number": season,
+        "episode_number": episode,
+    }
+    imdb_key = "parent_imdb_id" if _uses_parent_imdb_id(video_type, season, episode) else "imdb_id"
+    params[imdb_key] = _normalize_imdb_id(video_id)
+    return params
 
 
 def _build_fallback_queries(
@@ -348,7 +363,28 @@ def _http_get(url: str, **kwargs: Any) -> httpx.Response:
     try:
         return httpx.get(url, **kwargs)
     except httpx.HTTPError as exc:
-        raise OpenSubtitlesError("OpenSubtitles request failed: {0}".format(exc)) from exc
+        raise provider_reliability.make_provider_error(
+            OpenSubtitlesError,
+            provider="opensubtitles",
+            operation="network",
+            message="OpenSubtitles request failed because the provider could not be reached.",
+            error_type="network_error",
+            retryable=True,
+        ) from exc
+
+
+def _http_post(url: str, **kwargs: Any) -> httpx.Response:
+    try:
+        return httpx.post(url, **kwargs)
+    except httpx.HTTPError as exc:
+        raise provider_reliability.make_provider_error(
+            OpenSubtitlesError,
+            provider="opensubtitles",
+            operation="network",
+            message="OpenSubtitles request failed because the provider could not be reached.",
+            error_type="network_error",
+            retryable=True,
+        ) from exc
 
 
 def _attributes(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -366,7 +402,16 @@ def _normalize_language(language: str) -> str:
 
 
 def _normalize_type(video_type: str) -> str:
-    return "episode" if str(video_type or "").strip().lower() == "series" else "movie"
+    return "episode" if _is_episode_type(video_type) else "movie"
+
+
+def _is_episode_type(video_type: str) -> bool:
+    return str(video_type or "").strip().lower() in {"series", "episode", "tv"}
+
+
+def _uses_parent_imdb_id(video_type: str, season: Optional[int], episode: Optional[int]) -> bool:
+    normalized = str(video_type or "").strip().lower()
+    return normalized in {"series", "tv"} and season is not None and episode is not None
 
 
 def _normalize_imdb_id(video_id: str) -> str:
@@ -467,6 +512,103 @@ def _decode_download_bytes(content: bytes, content_type: str, download_url: str)
     return content
 
 
+def _handle_download_response(
+    response: httpx.Response,
+    *,
+    resolved_url: str,
+    user_agent: str,
+    timeout: float,
+) -> bytes:
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+
+    if isinstance(payload, dict):
+        link = _normalize_text(payload.get("link"))
+        if link:
+            binary = provider_reliability.run_with_retries(
+                lambda: _request_direct_download(
+                    link,
+                    headers={"User-Agent": user_agent},
+                    timeout=timeout,
+                ),
+            )
+            return _decode_download_bytes(binary.content, binary.headers.get("content-type", ""), link)
+        requested = _normalize_text(payload.get("requested_downloads")) or _normalize_text(payload.get("message"))
+        raise provider_reliability.make_provider_error(
+            OpenSubtitlesError,
+            provider="opensubtitles",
+            operation="download",
+            message=requested or "OpenSubtitles download response did not include a link.",
+            error_type="invalid_response",
+        )
+
+    return _decode_download_bytes(response.content, response.headers.get("content-type", ""), resolved_url)
+
+
+def _request_search_response(
+    url: str,
+    *,
+    params: Dict[str, Any],
+    headers: Dict[str, str],
+    timeout: float,
+) -> httpx.Response:
+    response = _http_get(url, params=params, headers=headers, timeout=timeout)
+    provider_reliability.raise_for_http_status(
+        response,
+        provider_label="OpenSubtitles",
+        operation="search",
+        error_cls=OpenSubtitlesError,
+    )
+    return response
+
+
+def _request_generated_download(
+    url: str,
+    *,
+    file_id: str,
+    api_key: str,
+    user_agent: str,
+    timeout: float,
+) -> httpx.Response:
+    response = _http_post(
+        url,
+        json={"file_id": file_id, "sub_format": "srt"},
+        headers=_api_headers(api_key, user_agent),
+        timeout=timeout,
+        follow_redirects=True,
+    )
+    provider_reliability.raise_for_http_status(
+        response,
+        provider_label="OpenSubtitles",
+        operation="download",
+        error_cls=OpenSubtitlesError,
+    )
+    return response
+
+
+def _request_direct_download(
+    url: str,
+    *,
+    headers: Dict[str, str],
+    timeout: float,
+) -> httpx.Response:
+    response = _http_get(
+        url,
+        headers=headers,
+        timeout=timeout,
+        follow_redirects=True,
+    )
+    provider_reliability.raise_for_http_status(
+        response,
+        provider_label="OpenSubtitles",
+        operation="download",
+        error_cls=OpenSubtitlesError,
+    )
+    return response
+
+
 def _looks_like_zip(content: bytes) -> bool:
     return bool(content and content[:4] == b"PK\x03\x04")
 
@@ -480,10 +622,40 @@ def _extract_srt_from_zip(content: bytes) -> bytes:
                 if not name.endswith("/") and name.lower().endswith(".srt")
             ]
             if not srt_names:
-                raise OpenSubtitlesError("OpenSubtitles zip download does not contain an .srt file.")
+                raise provider_reliability.make_provider_error(
+                    OpenSubtitlesError,
+                    provider="opensubtitles",
+                    operation="download",
+                    message="OpenSubtitles zip download does not contain an .srt file.",
+                    error_type="invalid_srt",
+                )
             return archive.read(srt_names[0])
     except zipfile.BadZipFile as exc:
-        raise OpenSubtitlesError("OpenSubtitles returned an invalid zip download.") from exc
+        raise provider_reliability.make_provider_error(
+            OpenSubtitlesError,
+            provider="opensubtitles",
+            operation="download",
+            message="OpenSubtitles returned an invalid zip download.",
+            error_type="invalid_srt",
+        ) from exc
+
+
+def _public_raw(raw: Dict[str, Any]) -> Dict[str, Any]:
+    attrs = _attributes(raw)
+    feature = _feature_details(raw)
+    return {
+        "id": raw.get("id") if raw.get("id") not in (None, "") else _subtitle_id(raw),
+        "language": _raw_language(raw),
+        "release_name": _normalize_text(attrs.get("release")) or _normalize_text(raw.get("release")),
+        "download_url": _download_url(raw, base_url=DEFAULT_BASE_URL),
+        "feature_details": {
+            "imdb_id": feature.get("imdb_id"),
+            "parent_imdb_id": feature.get("parent_imdb_id"),
+            "season_number": feature.get("season_number"),
+            "episode_number": feature.get("episode_number"),
+        },
+        "files": attrs.get("files"),
+    }
 
 
 def _normalize_text(value: Any) -> Optional[str]:

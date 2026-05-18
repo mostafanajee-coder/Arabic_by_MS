@@ -245,6 +245,35 @@ def get_usage_counts(db_path: PathLike) -> Dict[str, int]:
     }
 
 
+def get_provider_usage_counters(db_path: PathLike) -> Dict[str, Dict[str, int]]:
+    """Return today's provider usage counters grouped by provider and event type."""
+    counters: Dict[str, Dict[str, int]] = {
+        "provider_searches_today": {},
+        "provider_imports_today": {},
+    }
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT event_type, COALESCE(provider, '') AS provider_name, COALESCE(SUM(units), 0) AS total_units
+            FROM usage_events
+            WHERE event_type IN (?, ?)
+              AND substr(created_at, 1, 10) = ?
+            GROUP BY event_type, COALESCE(provider, '')
+            """,
+            (EVENT_PROVIDER_SEARCH, EVENT_PROVIDER_IMPORT, _today_utc()),
+        ).fetchall()
+    for row in rows:
+        event_type = str(row["event_type"] or "")
+        provider_name = str(row["provider_name"] or "").strip().lower() or "unknown"
+        target = (
+            counters["provider_searches_today"]
+            if event_type == EVENT_PROVIDER_SEARCH
+            else counters["provider_imports_today"]
+        )
+        target[provider_name] = int(row["total_units"] or 0)
+    return counters
+
+
 def get_usage_status(db_path: PathLike, *, auto_prepare_enabled: bool) -> Dict[str, Any]:
     """Return current daily usage totals, limits, and remaining counts."""
     limits = get_daily_limits()

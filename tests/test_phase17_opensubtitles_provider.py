@@ -179,10 +179,100 @@ def test_opensubtitles_search_normalization(client: TestClient, monkeypatch) -> 
     assert items[0]["release_name"] == "My.Show.S01E02.1080p.WEB-DL"
     assert items[0]["download_url"] == "https://api.opensubtitles.test/api/v1/download?file_id=8353887&sub_format=srt"
     assert items[0]["score"] > 0
-    assert calls[0]["params"]["imdb_id"] == "1111111"
+    assert calls[0]["params"]["parent_imdb_id"] == "1111111"
+    assert "imdb_id" not in calls[0]["params"]
+    assert calls[0]["params"]["season_number"] == 1
+    assert calls[0]["params"]["episode_number"] == 2
     assert calls[0]["params"]["type"] == "episode"
     assert calls[0]["headers"]["Api-Key"] == "os-key"
     assert calls[0]["headers"]["User-Agent"] == "ArabicByMS/0.17.0"
+
+
+def test_opensubtitles_search_episode_video_type_uses_imdb_id(monkeypatch) -> None:
+    monkeypatch.setenv("OPENSUBTITLES_API_KEY", "os-key")
+    monkeypatch.setenv("OPENSUBTITLES_USER_AGENT", "ArabicByMS/0.17.0")
+    monkeypatch.setenv("OPENSUBTITLES_BASE_URL", "https://api.opensubtitles.test/api/v1")
+
+    calls = []
+
+    def fake_get(url, params=None, headers=None, timeout=None, follow_redirects=None):
+        calls.append(
+            {
+                "url": url,
+                "params": params,
+                "headers": headers,
+                "timeout": timeout,
+                "follow_redirects": follow_redirects,
+            }
+        )
+        return FakeResponse(json_data={"data": []})
+
+    monkeypatch.setattr(opensubtitles_service.httpx, "get", fake_get)
+
+    items = opensubtitles_service.search_subtitles(
+        video_id="tt2222222",
+        video_type="episode",
+        season=1,
+        episode=2,
+        query="Episode Title",
+        release_name="Show.S01E02.1080p.WEB-DL",
+        language="en",
+    )
+
+    assert items == []
+    assert calls[0]["params"]["imdb_id"] == "2222222"
+    assert "parent_imdb_id" not in calls[0]["params"]
+    assert calls[0]["params"]["season_number"] == 1
+    assert calls[0]["params"]["episode_number"] == 2
+    assert calls[0]["params"]["type"] == "episode"
+
+
+def test_opensubtitles_download_uses_post_for_generated_file_id_url(monkeypatch) -> None:
+    monkeypatch.setenv("OPENSUBTITLES_API_KEY", "os-key")
+    monkeypatch.setenv("OPENSUBTITLES_USER_AGENT", "ArabicByMS/0.17.0")
+    monkeypatch.setenv("OPENSUBTITLES_BASE_URL", "https://api.opensubtitles.test/api/v1")
+
+    calls = []
+
+    def fake_post(url, json=None, headers=None, timeout=None, follow_redirects=None):
+        calls.append(
+            {
+                "method": "POST",
+                "url": url,
+                "json": json,
+                "headers": headers,
+                "timeout": timeout,
+                "follow_redirects": follow_redirects,
+            }
+        )
+        return FakeResponse(json_data={"link": "https://cdn.opensubtitles.test/files/sample.srt"})
+
+    def fake_get(url, params=None, headers=None, timeout=None, follow_redirects=None):
+        calls.append(
+            {
+                "method": "GET",
+                "url": url,
+                "params": params,
+                "headers": headers,
+                "timeout": timeout,
+                "follow_redirects": follow_redirects,
+            }
+        )
+        return FakeResponse(content=VALID_SRT_BYTES, headers={"content-type": "application/x-subrip"})
+
+    monkeypatch.setattr(opensubtitles_service, "_http_post", fake_post)
+    monkeypatch.setattr(opensubtitles_service, "_http_get", fake_get)
+
+    content = opensubtitles_service.download_subtitle_data(
+        "https://api.opensubtitles.test/api/v1/download?file_id=8353887&sub_format=srt"
+    )
+
+    assert content == VALID_SRT_BYTES
+    assert calls[0]["method"] == "POST"
+    assert calls[0]["url"] == "https://api.opensubtitles.test/api/v1/download"
+    assert calls[0]["json"] == {"file_id": "8353887", "sub_format": "srt"}
+    assert calls[1]["method"] == "GET"
+    assert calls[1]["url"] == "https://cdn.opensubtitles.test/files/sample.srt"
 
 
 def test_import_opensubtitles_successful_into_cache(client: TestClient, monkeypatch) -> None:
@@ -190,15 +280,28 @@ def test_import_opensubtitles_successful_into_cache(client: TestClient, monkeypa
     monkeypatch.setenv("OPENSUBTITLES_USER_AGENT", "ArabicByMS/0.17.0")
     monkeypatch.setenv("OPENSUBTITLES_BASE_URL", "https://api.opensubtitles.test/api/v1")
 
+    post_calls = []
+
+    def fake_post(url, json=None, headers=None, timeout=None, follow_redirects=None):
+        post_calls.append(
+            {
+                "url": url,
+                "json": json,
+                "headers": headers,
+                "timeout": timeout,
+                "follow_redirects": follow_redirects,
+            }
+        )
+        return FakeResponse(json_data={"link": "https://cdn.opensubtitles.test/files/sample.zip"})
+
     def fake_get(url, params=None, headers=None, timeout=None, follow_redirects=None):
-        if str(url).startswith("https://api.opensubtitles.test/api/v1/download"):
-            return FakeResponse(json_data={"link": "https://cdn.opensubtitles.test/files/sample.zip"})
         return FakeResponse(
             content=_make_zip_with_srt(),
             headers={"content-type": "application/zip"},
         )
 
     monkeypatch.setattr(opensubtitles_service.httpx, "get", fake_get)
+    monkeypatch.setattr(opensubtitles_service.httpx, "post", fake_post)
 
     response = client.post(
         "/companion/import-opensubtitles",
@@ -219,6 +322,8 @@ def test_import_opensubtitles_successful_into_cache(client: TestClient, monkeypa
     assert record is not None
     assert record["source_provider"] == "opensubtitles"
     assert record["source_subtitle_id"] == "7421396"
+    assert post_calls[0]["url"] == "https://api.opensubtitles.test/api/v1/download"
+    assert post_calls[0]["json"] == {"file_id": "8353887", "sub_format": "srt"}
 
 
 def test_provider_router_search_all_includes_opensubtitles(monkeypatch) -> None:

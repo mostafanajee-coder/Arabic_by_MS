@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 
+from services import provider_reliability
 from utils.subtitle_matcher import extract_release_name, sort_subtitle_matches
 
 DEFAULT_BASE_URL = "https://api.subdl.com/api/v1"
@@ -27,9 +28,15 @@ def get_config() -> Tuple[str, str]:
     api_key = (os.getenv("SUBDL_API_KEY") or "").strip()
     base_url = (os.getenv("SUBDL_BASE_URL") or "").strip() or DEFAULT_BASE_URL
     if not api_key:
-        raise SubDLNotConfiguredError(
-            "SUBDL_API_KEY is not set. Add it to your environment or .env file "
-            "before searching or importing from SubDL."
+        raise provider_reliability.make_provider_error(
+            SubDLNotConfiguredError,
+            provider="subdl",
+            operation="config",
+            message=(
+                "SUBDL_API_KEY is not set. Add it to your environment or .env file "
+                "before searching or importing from SubDL."
+            ),
+            error_type="missing_config",
         )
     return api_key, base_url.rstrip("/")
 
@@ -63,7 +70,7 @@ def search_subtitles(
     query: Optional[str] = None,
     language: str = "EN",
     release_name: Optional[str] = None,
-    timeout: float = 30.0,
+    timeout: float = provider_reliability.DEFAULT_SEARCH_TIMEOUT,
 ) -> List[Dict[str, Any]]:
     """Search SubDL and return normalized subtitle matches sorted by score."""
     api_key, base_url = get_config()
@@ -173,7 +180,10 @@ def normalize_result(
         "release_name": release,
         "download_url": download_url,
         "score": scored["score"],
-        "raw": raw,
+        "score_breakdown": scored["score_breakdown"],
+        "match_confidence": scored["match_confidence"],
+        "match_warnings": scored["match_warnings"],
+        "raw": _public_raw(raw),
     }
 
 
@@ -181,20 +191,17 @@ def download_subtitle_data(download_url: str, *, timeout: float = 60.0) -> bytes
     """Download a subtitle file from SubDL, extracting the first SRT from zips."""
     get_config()
     if not download_url or not str(download_url).strip():
-        raise SubDLError("SubDL download URL is missing.")
-
-    try:
-        response = httpx.get(download_url, timeout=timeout, follow_redirects=True)
-    except httpx.HTTPError as exc:
-        raise SubDLError("SubDL download request failed: {0}".format(exc)) from exc
-
-    if response.status_code != 200:
-        raise SubDLError(
-            "SubDL download returned HTTP {0}: {1}".format(
-                response.status_code,
-                response.text[:200],
-            )
+        raise provider_reliability.make_provider_error(
+            SubDLError,
+            provider="subdl",
+            operation="download",
+            message="SubDL download URL is missing.",
+            error_type="bad_request",
         )
+
+    response = provider_reliability.run_with_retries(
+        lambda: _request_download(download_url, timeout=timeout),
+    )
 
     content = response.content
     content_type = response.headers.get("content-type", "").lower()
@@ -213,32 +220,61 @@ def _request_subtitles(
     query = {"api_key": api_key}
     query.update({key: value for key, value in params.items() if value not in (None, "")})
 
-    try:
-        response = httpx.get(
+    response = provider_reliability.run_with_retries(
+        lambda: _send_search_request(
             base_url + "/subtitles",
             params=query,
-            headers={"Accept": "application/json"},
             timeout=timeout,
         )
-    except httpx.HTTPError as exc:
-        raise SubDLError("SubDL search request failed: {0}".format(exc)) from exc
-
-    if response.status_code != 200:
-        raise SubDLError(
-            "SubDL search returned HTTP {0}: {1}".format(
-                response.status_code,
-                response.text[:300],
-            )
-        )
+    )
 
     try:
         data = response.json()
     except ValueError as exc:
-        raise SubDLError("SubDL returned invalid JSON.") from exc
+        raise provider_reliability.make_provider_error(
+            SubDLError,
+            provider="subdl",
+            operation="search",
+            message="SubDL returned invalid JSON.",
+            error_type="invalid_response",
+        ) from exc
 
     if not data.get("status", False):
-        raise SubDLError(str(data.get("error") or "SubDL search failed."))
+        raise provider_reliability.make_provider_error(
+            SubDLError,
+            provider="subdl",
+            operation="search",
+            message=str(data.get("error") or "SubDL search failed."),
+            error_type="provider_error",
+        )
     return data
+
+
+def _send_search_request(url: str, *, params: Dict[str, Any], timeout: float) -> httpx.Response:
+    response = _http_get(
+        url,
+        params=params,
+        headers={"Accept": "application/json"},
+        timeout=timeout,
+    )
+    provider_reliability.raise_for_http_status(
+        response,
+        provider_label="SubDL",
+        operation="search",
+        error_cls=SubDLError,
+    )
+    return response
+
+
+def _request_download(download_url: str, *, timeout: float) -> httpx.Response:
+    response = _http_get(download_url, timeout=timeout, follow_redirects=True)
+    provider_reliability.raise_for_http_status(
+        response,
+        provider_label="SubDL",
+        operation="download",
+        error_cls=SubDLError,
+    )
+    return response
 
 
 def _append_candidates(
@@ -349,7 +385,46 @@ def _extract_srt_from_zip(content: bytes) -> bytes:
                 if not name.endswith("/") and name.lower().endswith(".srt")
             ]
             if not srt_names:
-                raise SubDLError("SubDL zip download does not contain an .srt file.")
+                raise provider_reliability.make_provider_error(
+                    SubDLError,
+                    provider="subdl",
+                    operation="download",
+                    message="SubDL zip download does not contain an .srt file.",
+                    error_type="invalid_srt",
+                )
             return archive.read(srt_names[0])
     except zipfile.BadZipFile as exc:
-        raise SubDLError("SubDL returned an invalid zip download.") from exc
+        raise provider_reliability.make_provider_error(
+            SubDLError,
+            provider="subdl",
+            operation="download",
+            message="SubDL returned an invalid zip download.",
+            error_type="invalid_srt",
+        ) from exc
+
+
+def _public_raw(raw: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": raw.get("id") if raw.get("id") not in (None, "") else _subtitle_id(raw),
+        "imdb_id": raw.get("imdb_id"),
+        "language": _raw_language(raw),
+        "release_name": extract_release_name(raw),
+        "download_url": _download_url(raw),
+        "season": raw.get("season") or raw.get("season_number"),
+        "episode": raw.get("episode") or raw.get("episode_number"),
+        "releases": raw.get("releases"),
+    }
+
+
+def _http_get(url: str, **kwargs: Any) -> httpx.Response:
+    try:
+        return httpx.get(url, **kwargs)
+    except httpx.HTTPError as exc:
+        raise provider_reliability.make_provider_error(
+            SubDLError,
+            provider="subdl",
+            operation="network",
+            message="SubDL request failed because the provider could not be reached.",
+            error_type="network_error",
+            retryable=True,
+        ) from exc

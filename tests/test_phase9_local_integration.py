@@ -33,7 +33,7 @@ def test_health_endpoint(client: TestClient) -> None:
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["app"] == "Arabic by M.S"
-    assert payload["version"] == "0.17.0"
+    assert payload["version"] == "0.20.0"
     assert payload["status"] == "ok"
     assert payload["cache_db_ready"] is True
     assert payload["cache_dirs_ready"] is True
@@ -45,7 +45,7 @@ def test_install_info_endpoint(client: TestClient) -> None:
     assert resp.status_code == 200
     payload = resp.json()
     assert payload["addon_name"] == "Arabic by M.S"
-    assert payload["version"] == "0.17.0"
+    assert payload["version"] == "0.20.0"
     assert payload["manifest_url"].endswith("/manifest.json")
     assert payload["companion_url"].endswith("/companion")
     assert payload["base_url"] == "http://testserver"

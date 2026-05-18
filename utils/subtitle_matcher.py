@@ -30,38 +30,91 @@ def score_subtitle_match(
     matched_video: Optional[Dict[str, Any]] = None,
 ) -> float:
     """Return a heuristic score for how well a subtitle candidate matches."""
-    score = 0.0
+    return evaluate_subtitle_match(
+        video_id=video_id,
+        language=language,
+        release_name=release_name,
+        season=season,
+        episode=episode,
+        candidate=candidate,
+        matched_video=matched_video,
+    )["score"]
+
+
+def evaluate_subtitle_match(
+    *,
+    video_id: str,
+    language: str,
+    release_name: Optional[str],
+    season: Optional[int],
+    episode: Optional[int],
+    candidate: Dict[str, Any],
+    matched_video: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Return score plus transparent scoring details for one candidate."""
+    breakdown = {
+        "imdb_match": 0.0,
+        "language_match": 0.0,
+        "season_match": 0.0,
+        "episode_match": 0.0,
+        "release_similarity": 0.0,
+        "important_tokens": 0.0,
+        "release_episode_match": 0.0,
+    }
 
     if _video_id_matches(video_id, candidate, matched_video):
-        score += 40.0
+        breakdown["imdb_match"] = 40.0
 
     candidate_language = _candidate_language(candidate)
     if _is_english_match(language, candidate_language):
-        score += 15.0
+        breakdown["language_match"] = 15.0
 
-    if season is not None:
-        candidate_season = _extract_int(candidate, ("season", "season_number"))
-        if candidate_season == season:
-            score += 10.0
+    candidate_season = _extract_int(candidate, ("season", "season_number"))
+    if season is not None and candidate_season == season:
+        breakdown["season_match"] = 10.0
 
-    if episode is not None:
-        candidate_episode = _extract_int(candidate, ("episode", "episode_number"))
-        if candidate_episode == episode:
-            score += 10.0
+    candidate_episode = _extract_int(candidate, ("episode", "episode_number"))
+    if episode is not None and candidate_episode == episode:
+        breakdown["episode_match"] = 10.0
 
     candidate_release = extract_release_name(candidate)
+    release_similarity = 0.0
+    important_token_overlap = 0.0
     if release_name and candidate_release:
-        score += 25.0 * _release_similarity(release_name, candidate_release)
-        score += 2.5 * _important_token_overlap(release_name, candidate_release)
+        release_similarity = _release_similarity(release_name, candidate_release)
+        important_token_overlap = _important_token_overlap(release_name, candidate_release)
+        breakdown["release_similarity"] = round(25.0 * release_similarity, 2)
+        breakdown["important_tokens"] = round(2.5 * important_token_overlap, 2)
     elif candidate_release:
-        score += 5.0
+        breakdown["release_similarity"] = 5.0
 
+    release_season, release_episode = (None, None)
     if season is not None and episode is not None and candidate_release:
         release_season, release_episode = _extract_season_episode(candidate_release)
         if release_season == season and release_episode == episode:
-            score += 8.0
+            breakdown["release_episode_match"] = 8.0
 
-    return round(score, 2)
+    score = round(sum(float(value) for value in breakdown.values()), 2)
+    warnings = _build_match_warnings(
+        requested_language=language,
+        candidate_language=candidate_language,
+        requested_release=release_name,
+        candidate_release=candidate_release,
+        release_similarity=release_similarity,
+        requested_season=season,
+        requested_episode=episode,
+        candidate_season=candidate_season,
+        candidate_episode=candidate_episode,
+        release_season=release_season,
+        release_episode=release_episode,
+        download_url=_candidate_download_url(candidate),
+    )
+    return {
+        "score": score,
+        "score_breakdown": breakdown,
+        "match_confidence": _match_confidence(score, warnings),
+        "match_warnings": warnings,
+    }
 
 
 def sort_subtitle_matches(
@@ -78,7 +131,7 @@ def sort_subtitle_matches(
     scored: List[Dict[str, Any]] = []
     for candidate in candidates:
         item = dict(candidate)
-        item["score"] = score_subtitle_match(
+        evaluation = evaluate_subtitle_match(
             video_id=video_id,
             language=language,
             release_name=release_name,
@@ -87,6 +140,10 @@ def sort_subtitle_matches(
             candidate=item,
             matched_video=matched_video,
         )
+        item["score"] = evaluation["score"]
+        item["score_breakdown"] = evaluation["score_breakdown"]
+        item["match_confidence"] = evaluation["match_confidence"]
+        item["match_warnings"] = evaluation["match_warnings"]
         scored.append(item)
     scored.sort(
         key=lambda item: (-float(item.get("score", 0.0)), str(item.get("release_name", "")))
@@ -139,6 +196,13 @@ def _candidate_language(candidate: Dict[str, Any]) -> str:
         value = candidate.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
+    return ""
+
+
+def _candidate_download_url(candidate: Dict[str, Any]) -> str:
+    value = candidate.get("download_url")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
     return ""
 
 
@@ -205,3 +269,67 @@ def _normalize_release(value: str) -> str:
 
 def _tokenize_release(value: str) -> List[str]:
     return _TOKEN_RE.findall(value.lower())
+
+
+def _build_match_warnings(
+    *,
+    requested_language: str,
+    candidate_language: str,
+    requested_release: Optional[str],
+    candidate_release: str,
+    release_similarity: float,
+    requested_season: Optional[int],
+    requested_episode: Optional[int],
+    candidate_season: Optional[int],
+    candidate_episode: Optional[int],
+    release_season: Optional[int],
+    release_episode: Optional[int],
+    download_url: str,
+) -> List[str]:
+    warnings: List[str] = []
+    if requested_release and candidate_release and release_similarity < 0.45:
+        warnings.append("Weak release match.")
+    if not download_url:
+        warnings.append("Download URL is missing.")
+    if candidate_language and not _is_english_match(requested_language, candidate_language):
+        warnings.append("Requested language does not match candidate language.")
+    if _has_season_episode_mismatch(
+        requested_season=requested_season,
+        requested_episode=requested_episode,
+        candidate_season=candidate_season,
+        candidate_episode=candidate_episode,
+        release_season=release_season,
+        release_episode=release_episode,
+    ):
+        warnings.append("Season/episode details do not match the requested title.")
+    return warnings
+
+
+def _has_season_episode_mismatch(
+    *,
+    requested_season: Optional[int],
+    requested_episode: Optional[int],
+    candidate_season: Optional[int],
+    candidate_episode: Optional[int],
+    release_season: Optional[int],
+    release_episode: Optional[int],
+) -> bool:
+    if requested_season is not None:
+        if candidate_season is not None and candidate_season != requested_season:
+            return True
+        if release_season is not None and release_season != requested_season:
+            return True
+    if requested_episode is not None:
+        if candidate_episode is not None and candidate_episode != requested_episode:
+            return True
+        if release_episode is not None and release_episode != requested_episode:
+            return True
+    return False
+
+
+def _match_confidence(score: float, warnings: List[str]) -> str:
+    if score >= 80.0 and not warnings:
+        return "high"
+    if score >= 45.0 and len(warnings) <= 2:
+        return "medium"
+    return "low"

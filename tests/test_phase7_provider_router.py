@@ -156,7 +156,10 @@ def test_search_all_one_provider_fails_other_succeeds(client: TestClient, monkey
     payload = resp.json()
     assert len(payload["items"]) == 1
     assert payload["items"][0]["provider"] == "subsource"
-    assert payload["provider_errors"]["subdl"] == "SubDL failed"
+    assert payload["provider_errors"]["subdl"]["provider"] == "subdl"
+    assert payload["provider_errors"]["subdl"]["error_type"] == "provider_error"
+    assert payload["provider_errors"]["subdl"]["http_status"] is None
+    assert payload["provider_errors"]["subdl"]["message"] == "SubDL failed"
 
 
 def test_search_all_deduplicates_results(client: TestClient, monkeypatch) -> None:

@@ -11,6 +11,9 @@ Phase 6: adds SubSource env-var settings (read at call time in
 services/subsource_service.py).
 Phase 17: adds OpenSubtitles env-var settings (read at call time in
 services/opensubtitles_service.py).
+Phase 18: adds provider reliability diagnostics and hardened retry handling.
+Phase 19: adds subtitle match intelligence and best-choice explanations.
+Phase 20: adds subtitle quality inspection and safe import warnings.
 """
 
 from __future__ import annotations
@@ -59,10 +62,10 @@ DB_PATH: Path = CACHE_DIR / "subtitles.db"
 
 ADDON_ID: str = os.getenv("ADDON_ID", "community.arabic.by.ms")
 ADDON_NAME: str = os.getenv("ADDON_NAME", "Arabic by M.S")
-ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.17.0")
+ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.20.0")
 ADDON_DESCRIPTION: str = os.getenv(
     "ADDON_DESCRIPTION",
-    "Arabic subtitles for Stremio. Phase 17 adds OpenSubtitles as an optional third English subtitle provider on top of the Phase 16 batch prepare queue, usage guardrails, one-click prepare, background jobs, preview, timing adjustment, preferred records, and exact movie and episode matching.",
+    "Arabic subtitles for Stremio. Phase 20 keeps the Phase 19 match intelligence, Phase 18 provider reliability, and Phase 17 OpenSubtitles behavior, and adds subtitle quality inspection, safe auto-rejection hints, background jobs, preview, timing adjustment, preferred records, and exact movie and episode matching.",
 )
 
 # ---------------------------------------------------------------------------

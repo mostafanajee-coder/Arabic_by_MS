@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import uuid
@@ -60,6 +61,10 @@ CREATE TABLE IF NOT EXISTS batch_prepare_items (
     job_id TEXT,
     provider TEXT,
     score REAL,
+    quality_score INTEGER,
+    quality_level TEXT,
+    quality_warnings TEXT,
+    reject_hint INTEGER NOT NULL DEFAULT 0,
     error_message TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -116,6 +121,10 @@ def init_db(db_path: PathLike) -> None:
                 "job_id": "TEXT",
                 "provider": "TEXT",
                 "score": "REAL",
+                "quality_score": "INTEGER",
+                "quality_level": "TEXT",
+                "quality_warnings": "TEXT",
+                "reject_hint": "INTEGER NOT NULL DEFAULT 0",
                 "error_message": "TEXT",
                 "created_at": "TEXT",
                 "updated_at": "TEXT",
@@ -235,6 +244,10 @@ def request_batch_prepare(
                 "job_id": None,
                 "provider": ready_record.get("source_provider") if item_status == ITEM_STATUS_SKIPPED_READY else None,
                 "score": None,
+                "quality_score": None,
+                "quality_level": None,
+                "quality_warnings": [],
+                "reject_hint": False,
                 "error_message": None,
                 "created_at": created_at,
                 "updated_at": created_at,
@@ -287,8 +300,9 @@ def request_batch_prepare(
             """
             INSERT INTO batch_prepare_items (
                 batch_id, canonical_video_key, video_id, season, episode, status,
-                record_id, job_id, provider, score, error_message, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                record_id, job_id, provider, score, quality_score, quality_level,
+                quality_warnings, reject_hint, error_message, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -302,6 +316,10 @@ def request_batch_prepare(
                     item["job_id"],
                     item["provider"],
                     item["score"],
+                    item["quality_score"],
+                    item["quality_level"],
+                    json.dumps(item["quality_warnings"]),
+                    int(bool(item["reject_hint"])),
                     item["error_message"],
                     item["created_at"],
                     item["updated_at"],
@@ -355,6 +373,10 @@ def get_batch_status(batch_id: str, db_path: PathLike) -> Optional[Dict[str, Any
                 "job_id": item["job_id"],
                 "provider": item["provider"],
                 "score": item["score"],
+                "quality_score": item["quality_score"],
+                "quality_level": item["quality_level"],
+                "quality_warnings": _decode_quality_warnings(item.get("quality_warnings")),
+                "reject_hint": bool(item.get("reject_hint")),
                 "error_message": item["error_message"],
             }
             for item in items
@@ -563,6 +585,10 @@ def _apply_prepare_result(db_path: PathLike, item_id: int, result: Dict[str, Any
             job_id=result.get("job_id"),
             provider=result.get("provider"),
             score=result.get("score"),
+            quality_score=result.get("quality_score"),
+            quality_level=result.get("quality_level"),
+            quality_warnings=result.get("quality_warnings"),
+            reject_hint=result.get("reject_hint"),
             error_message=None,
         )
         return
@@ -575,6 +601,10 @@ def _apply_prepare_result(db_path: PathLike, item_id: int, result: Dict[str, Any
             job_id=result.get("job_id"),
             provider=result.get("provider"),
             score=result.get("score"),
+            quality_score=result.get("quality_score"),
+            quality_level=result.get("quality_level"),
+            quality_warnings=result.get("quality_warnings"),
+            reject_hint=result.get("reject_hint"),
             error_message=None,
         )
         return
@@ -586,6 +616,10 @@ def _apply_prepare_result(db_path: PathLike, item_id: int, result: Dict[str, Any
         job_id=result.get("job_id"),
         provider=result.get("provider"),
         score=result.get("score"),
+        quality_score=result.get("quality_score"),
+        quality_level=result.get("quality_level"),
+        quality_warnings=result.get("quality_warnings"),
+        reject_hint=result.get("reject_hint"),
         error_message=str(result.get("message") or status or "Batch prepare item failed."),
     )
 
@@ -618,6 +652,10 @@ def _update_item(
     job_id: Optional[Any] = None,
     provider: Optional[Any] = None,
     score: Optional[Any] = None,
+    quality_score: Optional[Any] = None,
+    quality_level: Optional[Any] = None,
+    quality_warnings: Optional[Any] = None,
+    reject_hint: Optional[Any] = None,
     error_message: Optional[str] = None,
 ) -> None:
     with _connect(db_path) as conn:
@@ -629,6 +667,10 @@ def _update_item(
                 job_id = ?,
                 provider = ?,
                 score = ?,
+                quality_score = ?,
+                quality_level = ?,
+                quality_warnings = ?,
+                reject_hint = ?,
                 error_message = ?,
                 updated_at = ?
             WHERE id = ?
@@ -639,6 +681,10 @@ def _update_item(
                 _normalize_text(job_id),
                 _normalize_text(provider),
                 score,
+                quality_score,
+                _normalize_text(quality_level),
+                json.dumps(list(quality_warnings or [])),
+                int(bool(reject_hint)),
                 _normalize_text(error_message),
                 _utcnow_iso(),
                 item_id,
@@ -759,3 +805,15 @@ def _first_item_error(items: List[Dict[str, Any]]) -> Optional[str]:
         if message:
             return message
     return None
+
+
+def _decode_quality_warnings(value: Any) -> List[str]:
+    if value in (None, ""):
+        return []
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed]

@@ -55,7 +55,7 @@ from services.translation_service import (
 from utils.hash_utils import sha256_text
 from utils.srt_cleaner import TranslationFormatError
 from utils.srt_chunker import SRTParseError, parse_srt
-from utils.srt_quality import SRTQualityError
+from utils.srt_quality import SRTQualityError, merge_quality_metadata
 from utils.status_srt import build_status_srt
 from utils.stremio_id import parse_stremio_video_id
 from utils.srt_timing import SRTTimingError, shift_srt_content
@@ -135,6 +135,12 @@ _COMPANION_HTML = """<!doctype html>
   <div id="subdl-status" class="status-panel msg">Checking SubDL configuration...</div>
   <div id="subsource-status" class="status-panel msg">Checking SubSource configuration...</div>
   <div id="opensubtitles-status" class="status-panel msg">Checking OpenSubtitles configuration...</div>
+
+  <div class="section">
+    <h2>Provider Diagnostics</h2>
+    <div id="provider-diagnostics-panel" class="status-panel msg note">Loading provider diagnostics...</div>
+    <div id="provider-error-log" class="empty">No recent provider issues.</div>
+  </div>
 
   <div class="section">
     <form id="prepare-form">
@@ -460,6 +466,8 @@ _COMPANION_HTML = """<!doctype html>
     window._batchPollers = {};
     window._currentBatchId = null;
     window._usageStatus = null;
+    window._providerDiagnostics = null;
+    window._recentProviderErrors = [];
 
     function escapeHtml(s) {
       return String(s).replace(/[&<>"']/g, c => ({
@@ -551,6 +559,112 @@ _COMPANION_HTML = """<!doctype html>
     function renderOpensubtitlesStatus(status) {
       opensubtitlesStatus = status;
       renderProviderStatus("opensubtitles-status", "OpenSubtitles", status);
+    }
+
+    function providerLabel(name) {
+      const normalized = String(name || "").toLowerCase();
+      if (normalized === "subdl") return "SubDL";
+      if (normalized === "subsource") return "SubSource";
+      if (normalized === "opensubtitles") return "OpenSubtitles";
+      if (normalized === "gemini") return "Gemini";
+      if (normalized === "all") return "All";
+      return String(name || "provider");
+    }
+
+    function formatProviderError(details) {
+      if (!details || typeof details !== "object") {
+        return "";
+      }
+      const label = providerLabel(details.provider || "");
+      const type = details.error_type ? " [" + details.error_type + "]" : "";
+      const status = details.http_status ? " HTTP " + details.http_status : "";
+      const message = details.message || "Provider request failed.";
+      return label + type + status + ": " + message;
+    }
+
+    function qualityBadgeClass(level) {
+      if (level === "good") return "done";
+      if (level === "bad") return "failed";
+      return "pending";
+    }
+
+    function renderQualitySummary(data) {
+      if (!data || (data.quality_score === undefined && !data.quality_level && !(data.quality_warnings || []).length)) {
+        return "";
+      }
+      const warnings = Array.isArray(data.quality_warnings) ? data.quality_warnings : [];
+      const level = String(data.quality_level || "warning");
+      const score = data.quality_score === null || data.quality_score === undefined ? "n/a" : String(data.quality_score);
+      const summary = "<div class='msg note'><strong>Subtitle Quality:</strong> " +
+        "<span class='badge " + qualityBadgeClass(level) + "'>" + escapeHtml(level) + "</span>" +
+        " | score " + escapeHtml(score) + "/100" +
+        (warnings.length ? "<br />" + warnings.map(item => "- " + escapeHtml(String(item))).join("<br />") : "") +
+        "</div>";
+      if (!data.reject_hint) {
+        return summary;
+      }
+      const warningText = data.quality_message || "This subtitle looks risky enough that strict mode could reject it.";
+      return summary +
+        "<div class='msg err'><strong>Warning:</strong> " + escapeHtml(String(warningText)) + "</div>";
+    }
+
+    function renderRecentProviderErrors() {
+      const node = document.getElementById("provider-error-log");
+      if (!window._recentProviderErrors || window._recentProviderErrors.length === 0) {
+        node.className = "empty";
+        node.textContent = "No recent provider issues.";
+        return;
+      }
+      node.className = "";
+      node.innerHTML = "<div class='msg err'><strong>Recent provider issues:</strong><br />" +
+        window._recentProviderErrors.map(item =>
+          escapeHtml(String(item.source || "provider")) + ": " + escapeHtml(formatProviderError(item))
+        ).join("<br />") +
+        "</div>";
+    }
+
+    function rememberProviderErrors(source, providerErrors) {
+      const nextItems = Object.values(providerErrors || {})
+        .filter(item => item && typeof item === "object")
+        .map(item => Object.assign({ source: source }, item));
+      window._recentProviderErrors = (window._recentProviderErrors || []).filter(item => item.source !== source);
+      if (nextItems.length) {
+        window._recentProviderErrors = nextItems.concat(window._recentProviderErrors).slice(0, 8);
+      }
+      renderRecentProviderErrors();
+    }
+
+    function renderProviderDiagnostics(data) {
+      window._providerDiagnostics = data || {};
+      const node = document.getElementById("provider-diagnostics-panel");
+      const providers = data.providers || {};
+      const counters = data.provider_usage_counters || {};
+      const searches = counters.provider_searches_today || {};
+      const imports = counters.provider_imports_today || {};
+      const reliability = data.reliability || {};
+      const providerNames = ["gemini", "subdl", "subsource", "opensubtitles"];
+      const rows = providerNames.map(name => {
+        const status = providers[name] || {};
+        const recent = (window._recentProviderErrors || []).find(item => String(item.provider || "").toLowerCase() === name);
+        const statusText = status.configured ? "configured" : "disabled";
+        return "<tr>" +
+          "<td>" + escapeHtml(providerLabel(name)) + "</td>" +
+          "<td>" + escapeHtml(statusText) + "</td>" +
+          "<td>" + escapeHtml(String(searches[name] || 0)) + "</td>" +
+          "<td>" + escapeHtml(String(imports[name] || 0)) + "</td>" +
+          "<td>" + escapeHtml(recent ? formatProviderError(recent) : (status.message || "")) + "</td>" +
+          "</tr>";
+      }).join("");
+      const retrySettings = reliability.retries || {};
+      node.className = "status-panel msg note";
+      node.innerHTML = "<table><thead><tr><th>Provider</th><th>Status</th><th>Searches Today</th><th>Imports Today</th><th>Recent / Current Note</th></tr></thead><tbody>" +
+        rows +
+        "</tbody></table>" +
+        "<div class='summary'><strong>Retry settings:</strong> retries=" + escapeHtml(String(retrySettings.max_retries || 0)) +
+        " | retryable HTTP=" + escapeHtml(String((retrySettings.retryable_http_statuses || []).join(", "))) +
+        " | default search timeout=" + escapeHtml(String(retrySettings.default_search_timeout_seconds || "")) + "s" +
+        " | default download timeout=" + escapeHtml(String(retrySettings.default_download_timeout_seconds || "")) + "s</div>";
+      renderRecentProviderErrors();
     }
 
     function renderUsageStatus(data) {
@@ -647,6 +761,18 @@ _COMPANION_HTML = """<!doctype html>
       }
     }
 
+    async function refreshProviderDiagnostics() {
+      try {
+        const res = await fetch("/companion/provider-diagnostics");
+        const data = await res.json();
+        renderProviderDiagnostics(data);
+      } catch (err) {
+        const node = document.getElementById("provider-diagnostics-panel");
+        node.className = "status-panel msg err";
+        node.textContent = "Failed to load provider diagnostics: " + err.message;
+      }
+    }
+
     async function refreshUsage() {
       try {
         const [statusRes, eventsRes] = await Promise.all([
@@ -657,6 +783,7 @@ _COMPANION_HTML = """<!doctype html>
         const eventsData = await eventsRes.json();
         renderUsageStatus(statusData);
         renderUsageEvents(eventsData.items || []);
+        await refreshProviderDiagnostics();
       } catch (err) {
         const panel = document.getElementById("usage-status-panel");
         panel.className = "status-panel msg err";
@@ -738,16 +865,28 @@ _COMPANION_HTML = """<!doctype html>
 
       let itemsHtml = "<div class='empty'>No batch items.</div>";
       if (data.items && data.items.length) {
-        itemsHtml = "<table><thead><tr><th>Episode</th><th>Canonical</th><th>Status</th><th>Record</th><th>Job</th><th>Error</th></tr></thead><tbody>" +
+        itemsHtml = "<table><thead><tr><th>Episode</th><th>Canonical</th><th>Status</th><th>Record</th><th>Job</th><th>Quality</th><th>Error</th></tr></thead><tbody>" +
           data.items.map(item =>
+            {
+              const qualityWarnings = Array.isArray(item.quality_warnings) ? item.quality_warnings : [];
+              const qualityCell = item.quality_level
+                ? "<span class='badge " + qualityBadgeClass(String(item.quality_level || "")) + "'>" + escapeHtml(String(item.quality_level || "")) + "</span>" +
+                  " " + escapeHtml(String(item.quality_score ?? "")) + "/100" +
+                  (qualityWarnings.length ? "<br />" + qualityWarnings.slice(0, 2).map(text => escapeHtml(String(text))).join("<br />") : "") +
+                  (item.reject_hint ? "<br /><strong>Review before translate.</strong>" : "")
+                : "";
+              return (
             "<tr>" +
             "<td>S" + escapeHtml(String(item.season || "")) + "E" + escapeHtml(String(item.episode || "")) + "</td>" +
             "<td><code>" + escapeHtml(item.canonical_video_key || "") + "</code></td>" +
             "<td><span class='badge " + batchBadgeClass(String(item.status || "")) + "'>" + escapeHtml(String(item.status || "")) + "</span></td>" +
             "<td>" + escapeHtml(String(item.record_id || "")) + "</td>" +
             "<td>" + escapeHtml(String(item.job_id || "")) + "</td>" +
+            "<td>" + qualityCell + "</td>" +
             "<td>" + escapeHtml(String(item.error_message || "")) + "</td>" +
             "</tr>"
+              );
+            }
           ).join("") +
           "</tbody></table>";
       }
@@ -1009,7 +1148,8 @@ _COMPANION_HTML = """<!doctype html>
         if (!res.ok) {
           box.innerHTML = "<div class='msg err'>" + escapeHtml(data.detail || "Import failed") + "</div>";
         } else {
-          box.innerHTML = "<div class='msg ok'>Imported as record #" + escapeHtml(data.id) + ".</div>";
+          box.innerHTML = "<div class='msg ok'>Imported as record #" + escapeHtml(data.id) + ".</div>" +
+            renderQualitySummary(data);
           await refreshList();
           await refreshUsage();
         }
@@ -1226,7 +1366,10 @@ _COMPANION_HTML = """<!doctype html>
       }
       const errorKeys = Object.keys(providerErrors || {});
       if (errorKeys.length) {
-        summaries.push("Provider issues: " + errorKeys.map(key => escapeHtml(key + ": " + providerErrors[key])).join(" | "));
+        summaries.push(
+          "Provider issues: " +
+          errorKeys.map(key => escapeHtml(formatProviderError(providerErrors[key]))).join(" | ")
+        );
       }
 
       if (!items || items.length === 0) {
@@ -1236,10 +1379,20 @@ _COMPANION_HTML = """<!doctype html>
         return;
       }
 
+      function warningBadges(item) {
+        const warnings = Array.isArray(item.match_warnings) ? item.match_warnings : [];
+        if (!warnings.length) {
+          return "<span class='badge done'>none</span>";
+        }
+        return warnings.slice(0, 3).map(text =>
+          "<span class='badge failed'>" + escapeHtml(text) + "</span>"
+        ).join(" ");
+      }
+
       node.className = "";
       node.innerHTML = `<table>
         <thead><tr>
-          <th>Rank</th><th>Provider</th><th>Subtitle ID</th><th>Language</th><th>Release</th><th>Score</th>
+          <th>Rank</th><th>Provider</th><th>Subtitle ID</th><th>Language</th><th>Release</th><th>Score</th><th>Confidence</th><th>Warnings</th>
         </tr></thead>
         <tbody>${items.map((item, index) => `
           <tr>
@@ -1249,6 +1402,8 @@ _COMPANION_HTML = """<!doctype html>
             <td>${escapeHtml(item.language || "")}</td>
             <td>${escapeHtml(item.release_name || "")}</td>
             <td>${escapeHtml(String(item.score || 0))}</td>
+            <td><span class='badge ${item.match_confidence === "high" ? "done" : (item.match_confidence === "medium" ? "pending" : "failed")}'>${escapeHtml(String(item.match_confidence || "unknown"))}</span></td>
+            <td>${warningBadges(item)}</td>
           </tr>`).join("")}
         </tbody>
       </table>` +
@@ -1384,9 +1539,11 @@ _COMPANION_HTML = """<!doctype html>
           return;
         }
         window._allItems = data.items || [];
+        rememberProviderErrors("search-all", data.provider_errors || {});
         renderSearchAllResults(window._allItems, data.provider_errors || {}, data.searched_providers || []);
         result.innerHTML = "<div class='msg ok'>Found " + escapeHtml(String(window._allItems.length)) + " ranked result(s).</div>";
         await refreshUsage();
+        await refreshProviderDiagnostics();
       } catch (err) {
         result.innerHTML = "<div class='msg err'>" + escapeHtml(err.message) + "</div>";
       } finally {
@@ -1538,16 +1695,22 @@ _COMPANION_HTML = """<!doctype html>
           return;
         }
         if (!res.ok) {
+          rememberProviderErrors("import-best", data.provider_errors || {});
           result.innerHTML = "<div class='msg err'>" + escapeHtml(data.detail || "Import best failed") + "</div>";
+          await refreshProviderDiagnostics();
           return;
         }
+        rememberProviderErrors("import-best", data.provider_errors || {});
         const translated = data.arabic_srt_path ? " translated" : "";
         const background = data.job_id ? " background job " + escapeHtml(String(data.job_id)) + "." : "";
         result.innerHTML = "<div class='msg ok'>Imported best result from " +
           escapeHtml(data.provider) + " as record #" + escapeHtml(String(data.record_id)) +
-          " (" + escapeHtml(data.status) + ")" + escapeHtml(translated) + "." + background + "</div>";
+          " (" + escapeHtml(data.status) + ")" + escapeHtml(translated) + "." + background + "</div>" +
+          (data.selected_reason ? "<div class='msg note'><strong>Why selected?</strong><br />" + escapeHtml(String(data.selected_reason)) + "</div>" : "") +
+          renderQualitySummary(data);
         await refreshList();
         await refreshUsage();
+        await refreshProviderDiagnostics();
         if (data.job_id) {
           startJobPolling(data.job_id, data.record_id);
         }
@@ -1654,6 +1817,7 @@ _COMPANION_HTML = """<!doctype html>
     refreshInstallInfo();
     refreshHealth();
     refreshProviderStatus();
+    refreshProviderDiagnostics();
     refreshSubsourceStatus();
     refreshUsage();
     refreshLatestBatch();
@@ -1728,6 +1892,7 @@ def _store_english_srt_record(
     source_provider: Optional[str] = None,
     source_subtitle_id: Optional[str] = None,
     source_download_url: Optional[str] = None,
+    quality_metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Persist a validated English SRT and return the record payload."""
     english_hash = sha256_text(text)
@@ -1776,7 +1941,7 @@ def _store_english_srt_record(
         source_download_url=normalized_source_download_url,
     )
 
-    return {
+    payload = {
         "id": record_id,
         "video_id": normalized_video_id,
         "imdb_id": identity["imdb_id"] or None,
@@ -1801,6 +1966,9 @@ def _store_english_srt_record(
         "progress_done_chunks": None,
         "progress_message": None,
     }
+    if quality_metadata:
+        return merge_quality_metadata(payload, quality_metadata)
+    return payload
 
 
 def _parse_import_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2172,8 +2340,12 @@ def _import_provider_item(
     download_url: str,
 ) -> Dict[str, Any]:
     try:
-        raw = provider_router.download_subtitle_data(provider, download_url)
-        text = validate_srt_content(raw)
+        inspected = provider_router.download_and_analyze_subtitle(
+            provider,
+            download_url,
+            expected_language="en",
+            strict_quality=False,
+        )
     except (
         SubDLNotConfiguredError,
         SubSourceNotConfiguredError,
@@ -2191,10 +2363,11 @@ def _import_provider_item(
         season=season,
         episode=episode,
         release_name=release_name,
-        text=text,
+        text=str(inspected["text"]),
         source_provider=provider,
         source_subtitle_id=subtitle_id,
         source_download_url=download_url,
+        quality_metadata=inspected,
     )
     _record_provider_import_event(
         provider=provider,
@@ -2367,6 +2540,16 @@ def opensubtitles_status() -> Dict[str, Any]:
 def provider_status() -> Dict[str, Any]:
     """Return combined Gemini and provider configuration status."""
     return provider_router.get_provider_status()
+
+
+@router.get("/companion/provider-diagnostics")
+def provider_diagnostics() -> Dict[str, Any]:
+    """Return safe provider diagnostics, retry settings, and local counters."""
+    return {
+        "providers": provider_router.get_provider_status(),
+        "provider_usage_counters": usage_guard.get_provider_usage_counters(config.DB_PATH),
+        "reliability": provider_router.get_reliability_settings(),
+    }
 
 
 @router.get("/companion/install-info")
@@ -3141,9 +3324,13 @@ async def import_best(request: Request) -> JSONResponse:
     )
     items = search_result.get("items") or []
     if not items:
-        raise HTTPException(
+        return JSONResponse(
+            {
+                "detail": "No subtitle results found across the configured providers.",
+                "provider_errors": search_result.get("provider_errors") or {},
+                "searched_providers": search_result.get("searched_providers") or [],
+            },
             status_code=404,
-            detail="No subtitle results found across the configured providers.",
         )
 
     best = dict(items[0])
@@ -3185,9 +3372,17 @@ async def import_best(request: Request) -> JSONResponse:
             "record_id": stored["id"],
             "provider": best.get("provider"),
             "score": best.get("score"),
+            "selected_reason": provider_router.describe_selected_item(items),
             "status": status,
             "arabic_srt_path": arabic_srt_path,
             "job_id": job_id,
+            "provider_errors": search_result.get("provider_errors") or {},
+            "searched_providers": search_result.get("searched_providers") or [],
+            "quality_score": stored.get("quality_score"),
+            "quality_level": stored.get("quality_level"),
+            "quality_warnings": stored.get("quality_warnings") or [],
+            "reject_hint": bool(stored.get("reject_hint")),
+            "quality_message": stored.get("quality_message"),
         }
     )
 

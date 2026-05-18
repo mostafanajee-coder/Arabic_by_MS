@@ -66,6 +66,7 @@ def _run_import_best(
     *,
     items: list[dict],
     payload_by_url: dict[str, bytes],
+    body: dict | None = None,
 ) -> dict:
     monkeypatch.setattr(
         provider_router,
@@ -81,7 +82,10 @@ def _run_import_best(
         "download_subtitle_data",
         lambda provider, url: payload_by_url[url],
     )
-    response = client.post("/companion/import-best", json={"video_id": "tt2200001"})
+    payload = {"video_id": "tt2200001"}
+    if body:
+        payload.update(body)
+    response = client.post("/companion/import-best", json=payload)
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -148,6 +152,7 @@ def test_fail_count_increments(client: TestClient, monkeypatch) -> None:
                 "https://subdl.local/repeat-bad.srt": BAD_QUALITY_SRT.encode("utf-8"),
                 "https://subsource.local/clean-fallback.srt": GOOD_SRT.encode("utf-8"),
             },
+            body={"force_provider_search": True},
         )
 
     quarantine_payload = client.get("/companion/provider-quarantine")
@@ -181,6 +186,7 @@ def test_repeated_bad_candidate_is_deprioritized(client: TestClient, monkeypatch
                 "https://subdl.local/tainted.srt": BAD_QUALITY_SRT.encode("utf-8"),
                 "https://subsource.local/bootstrap-good.srt": GOOD_SRT.encode("utf-8"),
             },
+            body={"force_provider_search": True},
         )
 
     payload = _run_import_best(
@@ -206,6 +212,7 @@ def test_repeated_bad_candidate_is_deprioritized(client: TestClient, monkeypatch
             "https://subdl.local/tainted.srt": GOOD_SRT.encode("utf-8"),
             "https://subsource.local/clean-close.srt": GOOD_SRT.encode("utf-8"),
         },
+        body={"force_provider_search": True},
     )
 
     assert payload["provider"] == "subsource"
@@ -234,6 +241,7 @@ def test_quarantine_does_not_hard_block_when_all_candidates_quarantined(
             payload_by_url={
                 "https://subdl.local/only-candidate.srt": BAD_QUALITY_SRT.encode("utf-8"),
             },
+            body={"force_provider_search": True},
         )
 
     payload = _run_import_best(
@@ -251,6 +259,7 @@ def test_quarantine_does_not_hard_block_when_all_candidates_quarantined(
         payload_by_url={
             "https://subdl.local/only-candidate.srt": GOOD_SRT.encode("utf-8"),
         },
+        body={"force_provider_search": True},
     )
 
     assert payload["provider"] == "subdl"

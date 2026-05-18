@@ -67,6 +67,9 @@ CREATE TABLE IF NOT EXISTS batch_prepare_items (
     reject_hint INTEGER NOT NULL DEFAULT 0,
     local_first_reused INTEGER NOT NULL DEFAULT 0,
     local_reuse_reason TEXT,
+    cache_integrity_status TEXT,
+    cache_integrity_warnings TEXT,
+    cache_integrity_checked_at TEXT,
     error_message TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -129,6 +132,9 @@ def init_db(db_path: PathLike) -> None:
                 "reject_hint": "INTEGER NOT NULL DEFAULT 0",
                 "local_first_reused": "INTEGER NOT NULL DEFAULT 0",
                 "local_reuse_reason": "TEXT",
+                "cache_integrity_status": "TEXT",
+                "cache_integrity_warnings": "TEXT",
+                "cache_integrity_checked_at": "TEXT",
                 "error_message": "TEXT",
                 "created_at": "TEXT",
                 "updated_at": "TEXT",
@@ -255,6 +261,7 @@ def request_batch_prepare(
                 "reject_hint": False,
                 "local_first_reused": False,
                 "local_reuse_reason": None,
+                "cache_integrity": None,
                 "error_message": None,
                 "created_at": created_at,
                 "updated_at": created_at,
@@ -309,8 +316,9 @@ def request_batch_prepare(
                 batch_id, canonical_video_key, video_id, season, episode, status,
                 record_id, job_id, provider, score, quality_score, quality_level,
                 quality_warnings, reject_hint, local_first_reused, local_reuse_reason,
+                cache_integrity_status, cache_integrity_warnings, cache_integrity_checked_at,
                 error_message, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -330,6 +338,9 @@ def request_batch_prepare(
                     int(bool(item["reject_hint"])),
                     int(bool(item["local_first_reused"])),
                     item["local_reuse_reason"],
+                    _cache_integrity_status(item.get("cache_integrity")),
+                    json.dumps(_cache_integrity_warnings(item.get("cache_integrity"))),
+                    _cache_integrity_checked_at(item.get("cache_integrity")),
                     item["error_message"],
                     item["created_at"],
                     item["updated_at"],
@@ -390,6 +401,13 @@ def get_batch_status(batch_id: str, db_path: PathLike) -> Optional[Dict[str, Any
                 "reject_hint": bool(item.get("reject_hint")),
                 "local_first_reused": bool(item.get("local_first_reused")),
                 "local_reuse_reason": item.get("local_reuse_reason"),
+                "cache_integrity": {
+                    "integrity_status": _normalize_text(item.get("cache_integrity_status")),
+                    "integrity_warnings": _decode_quality_warnings(item.get("cache_integrity_warnings")),
+                    "checked_at": _normalize_text(item.get("cache_integrity_checked_at")),
+                }
+                if _normalize_text(item.get("cache_integrity_status"))
+                else None,
                 "error_message": item["error_message"],
             }
             for item in items
@@ -623,6 +641,7 @@ def _apply_prepare_result(db_path: PathLike, item_id: int, result: Dict[str, Any
             reject_hint=result.get("reject_hint"),
             local_first_reused=result.get("local_first_reused"),
             local_reuse_reason=result.get("local_reuse_reason"),
+            cache_integrity=result.get("cache_integrity"),
             error_message=None,
         )
         return
@@ -641,6 +660,7 @@ def _apply_prepare_result(db_path: PathLike, item_id: int, result: Dict[str, Any
             reject_hint=result.get("reject_hint"),
             local_first_reused=result.get("local_first_reused"),
             local_reuse_reason=result.get("local_reuse_reason"),
+            cache_integrity=result.get("cache_integrity"),
             error_message=None,
         )
         return
@@ -658,6 +678,7 @@ def _apply_prepare_result(db_path: PathLike, item_id: int, result: Dict[str, Any
         reject_hint=result.get("reject_hint"),
         local_first_reused=result.get("local_first_reused"),
         local_reuse_reason=result.get("local_reuse_reason"),
+        cache_integrity=result.get("cache_integrity"),
         error_message=str(result.get("message") or status or "Batch prepare item failed."),
     )
 
@@ -696,6 +717,7 @@ def _update_item(
     reject_hint: Optional[Any] = None,
     local_first_reused: Optional[Any] = None,
     local_reuse_reason: Optional[str] = None,
+    cache_integrity: Optional[Dict[str, Any]] = None,
     error_message: Optional[str] = None,
 ) -> None:
     with _connect(db_path) as conn:
@@ -713,6 +735,9 @@ def _update_item(
                 reject_hint = ?,
                 local_first_reused = ?,
                 local_reuse_reason = ?,
+                cache_integrity_status = ?,
+                cache_integrity_warnings = ?,
+                cache_integrity_checked_at = ?,
                 error_message = ?,
                 updated_at = ?
             WHERE id = ?
@@ -729,6 +754,9 @@ def _update_item(
                 int(bool(reject_hint)),
                 int(bool(local_first_reused)),
                 _normalize_text(local_reuse_reason),
+                _cache_integrity_status(cache_integrity),
+                json.dumps(_cache_integrity_warnings(cache_integrity)),
+                _cache_integrity_checked_at(cache_integrity),
                 _normalize_text(error_message),
                 _utcnow_iso(),
                 item_id,
@@ -861,3 +889,15 @@ def _decode_quality_warnings(value: Any) -> List[str]:
     if not isinstance(parsed, list):
         return []
     return [str(item) for item in parsed]
+
+
+def _cache_integrity_status(value: Optional[Dict[str, Any]]) -> Optional[str]:
+    return _normalize_text((value or {}).get("integrity_status"))
+
+
+def _cache_integrity_warnings(value: Optional[Dict[str, Any]]) -> List[str]:
+    return [str(item) for item in ((value or {}).get("integrity_warnings") or []) if str(item).strip()]
+
+
+def _cache_integrity_checked_at(value: Optional[Dict[str, Any]]) -> Optional[str]:
+    return _normalize_text((value or {}).get("checked_at"))

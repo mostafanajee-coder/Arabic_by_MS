@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from services import (
+    cache_integrity,
     provider_import_history,
     opensubtitles_service,
     provider_quarantine,
@@ -157,6 +158,7 @@ def import_best_with_quality_fallback(
             "selected_import_history": None,
             "reused_existing_record": False,
             "import_history_note": None,
+            "selected_cache_integrity": None,
         }
 
     limit = max(1, int(max_candidates or IMPORT_BEST_FALLBACK_LIMIT))
@@ -170,7 +172,26 @@ def import_best_with_quality_fallback(
         tried_entry = _build_tried_candidate_entry(item, rank=index + 1)
         import_history = dict(tried_entry.get("import_history") or {})
         if bool(import_history.get("is_previously_imported")) and import_history.get("record_id"):
+            integrity = (
+                cache_integrity.verify_import_history_summary(
+                    str(db_path),
+                    import_history,
+                    persist=True,
+                )
+                if db_path
+                else {
+                    "record_id": import_history.get("record_id"),
+                    "integrity_status": cache_integrity.STATUS_STALE_RECORD,
+                    "integrity_warnings": ["Cached integrity checks are unavailable."],
+                    "checked_at": None,
+                    "quality_level": import_history.get("quality_level"),
+                    "quality_score": import_history.get("quality_score"),
+                    "quality_acceptable": False,
+                }
+            )
+            tried_entry["cache_integrity"] = integrity
             history_quality = _quality_summary_from_import_history(import_history)
+            tried_entry.update(history_quality)
             tried_entry.update(
                 {
                     "status": "selected_reused",
@@ -178,37 +199,38 @@ def import_best_with_quality_fallback(
                     "skip_message": None,
                 }
             )
-            tried_entry.update(history_quality)
-            if history_quality.get("reject_hint"):
-                _record_quarantine_issue(
-                    db_path=db_path,
-                    tried_entry=tried_entry,
-                    reason="bad_quality",
-                    quality=history_quality,
-                )
-            tried_candidates.append(tried_entry)
-            fallback_reason = None
-            if index > 0:
-                fallback_reason = _build_fallback_reason(tried_candidates[:-1])
-                fallback_reason = _merge_reason_text(
-                    fallback_reason,
-                    quarantine_context.get("quarantine_note"),
-                )
-            return {
-                "selected_item": item,
-                "selected_index": index,
-                "selected_quality": history_quality,
-                "tried_candidates": tried_candidates,
-                "fallback_reason": fallback_reason,
-                "selection_warning": None,
-                "remaining_ranked_items": ranked_items[index:],
-                "selected_quarantine": tried_entry.get("quarantine") or item.get("quarantine"),
-                "quarantine_affected_selection": bool(quarantine_context.get("ranking_changed")),
-                "quarantine_note": quarantine_context.get("quarantine_note"),
-                "selected_import_history": import_history,
-                "reused_existing_record": True,
-                "import_history_note": "This exact provider subtitle was already imported for this title, so the cached record was reused.",
-            }
+            if _is_safe_cached_reuse(integrity):
+                if history_quality.get("reject_hint"):
+                    _record_quarantine_issue(
+                        db_path=db_path,
+                        tried_entry=tried_entry,
+                        reason="bad_quality",
+                        quality=history_quality,
+                    )
+                tried_candidates.append(tried_entry)
+                fallback_reason = None
+                if index > 0:
+                    fallback_reason = _build_fallback_reason(tried_candidates[:-1])
+                    fallback_reason = _merge_reason_text(
+                        fallback_reason,
+                        quarantine_context.get("quarantine_note"),
+                    )
+                return {
+                    "selected_item": item,
+                    "selected_index": index,
+                    "selected_quality": history_quality,
+                    "tried_candidates": tried_candidates,
+                    "fallback_reason": fallback_reason,
+                    "selection_warning": None,
+                    "remaining_ranked_items": ranked_items[index:],
+                    "selected_quarantine": tried_entry.get("quarantine") or item.get("quarantine"),
+                    "quarantine_affected_selection": bool(quarantine_context.get("ranking_changed")),
+                    "quarantine_note": quarantine_context.get("quarantine_note"),
+                    "selected_import_history": import_history,
+                    "reused_existing_record": True,
+                    "import_history_note": "This exact provider subtitle was already imported for this title, so the cached record was reused.",
+                    "selected_cache_integrity": integrity,
+                }
 
         download_url = str(item.get("download_url") or "").strip()
         if not download_url:
@@ -333,6 +355,7 @@ def import_best_with_quality_fallback(
             "selected_import_history": tried_entry.get("import_history") or item.get("import_history"),
             "reused_existing_record": False,
             "import_history_note": None,
+            "selected_cache_integrity": tried_entry.get("cache_integrity"),
         }
 
     if best_bad_item is not None and best_bad_quality is not None:
@@ -367,6 +390,7 @@ def import_best_with_quality_fallback(
             "selected_import_history": (selected_entry or {}).get("import_history") or best_bad_item.get("import_history"),
             "reused_existing_record": False,
             "import_history_note": None,
+            "selected_cache_integrity": (selected_entry or {}).get("cache_integrity"),
         }
 
     return {
@@ -386,6 +410,7 @@ def import_best_with_quality_fallback(
         "selected_import_history": None,
         "reused_existing_record": False,
         "import_history_note": None,
+        "selected_cache_integrity": None,
     }
 
 
@@ -583,6 +608,7 @@ def _build_tried_candidate_entry(item: Dict[str, Any], *, rank: int) -> Dict[str
         "provider_error": None,
         "quarantine": dict(item.get("quarantine") or {}),
         "import_history": dict(item.get("import_history") or {}),
+        "cache_integrity": dict(item.get("cache_integrity") or {}),
     }
 
 
@@ -606,6 +632,15 @@ def _quality_summary_from_import_history(history: Dict[str, Any]) -> Dict[str, A
         "quality_warnings": [],
         "reject_hint": quality_level == "bad",
     }
+
+
+def _is_safe_cached_reuse(integrity: Dict[str, Any]) -> bool:
+    return (
+        str(integrity.get("integrity_status") or "") == cache_integrity.STATUS_VALID
+        and bool(integrity.get("quality_acceptable"))
+    )
+
+
 
 
 def _build_fallback_reason(tried_candidates: List[Dict[str, Any]]) -> Optional[str]:

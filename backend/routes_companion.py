@@ -17,6 +17,7 @@ from .manifest import build_manifest
 from .routes_subtitles import router as subtitles_router
 from services import (
     batch_prepare_service,
+    cache_integrity,
     gemini_service,
     job_manager,
     opensubtitles_service,
@@ -68,7 +69,6 @@ from utils.srt_validator import (
 )
 
 router = APIRouter()
-_ORIGINAL_SEARCH_ALL_SUBTITLES = provider_router.search_all_subtitles
 
 
 _COMPANION_HTML = """<!doctype html>
@@ -144,6 +144,8 @@ _COMPANION_HTML = """<!doctype html>
     <div class="actions">
       <button type="button" id="clear-quarantine-btn" class="secondary">Clear quarantine</button>
       <button type="button" id="clear-import-history-btn" class="secondary">Clear import history</button>
+      <button type="button" id="scan-cache-integrity-btn" class="secondary">Scan cache</button>
+      <button type="button" id="repair-cache-integrity-btn" class="secondary">Repair metadata</button>
     </div>
     <div id="provider-diagnostics-panel" class="status-panel msg note">Loading provider diagnostics...</div>
     <div id="provider-error-log" class="empty">No recent provider issues.</div>
@@ -727,6 +729,9 @@ _COMPANION_HTML = """<!doctype html>
       const quarantineItems = Array.isArray(quarantine.items) ? quarantine.items : [];
       const importHistory = data.import_history || {};
       const importHistoryItems = Array.isArray(importHistory.items) ? importHistory.items : [];
+      const cacheIntegrity = data.cache_integrity || {};
+      const cacheIntegrityCounts = cacheIntegrity.counts || {};
+      const cacheIntegrityItems = Array.isArray(cacheIntegrity.items) ? cacheIntegrity.items : [];
       const providerNames = ["gemini", "subdl", "subsource", "opensubtitles"];
       const rows = providerNames.map(name => {
         const status = providers[name] || {};
@@ -767,6 +772,27 @@ _COMPANION_HTML = """<!doctype html>
           ).join("") +
           "</tbody></table></div>"
         : "<div class='summary'><strong>Provider Import History</strong>: no remembered imports yet.</div>";
+      const cacheIntegrityHtml = "<div class='summary'><strong>Cache Integrity</strong>: " +
+        "valid=" + escapeHtml(String(cacheIntegrityCounts.valid || 0)) +
+        " | missing_file=" + escapeHtml(String(cacheIntegrityCounts.missing_file || 0)) +
+        " | invalid_srt=" + escapeHtml(String(cacheIntegrityCounts.invalid_srt || 0)) +
+        " | stale_record=" + escapeHtml(String(cacheIntegrityCounts.stale_record || 0)) +
+        " | unreadable_file=" + escapeHtml(String(cacheIntegrityCounts.unreadable_file || 0)) +
+        " | last scan=" + escapeHtml(String(cacheIntegrity.last_scan_at || "never")) +
+        "</div>" +
+        (cacheIntegrityItems.length
+          ? "<div class='summary'><table><thead><tr><th>Record</th><th>Provider</th><th>Release</th><th>Status</th><th>Checked (UTC)</th></tr></thead><tbody>" +
+            cacheIntegrityItems.map(item =>
+              "<tr>" +
+              "<td>" + escapeHtml(String(item.record_id || "")) + "</td>" +
+              "<td>" + escapeHtml(providerLabel(item.provider || "")) + "</td>" +
+              "<td>" + escapeHtml(String(item.release_name || item.video_identity || "")) + "</td>" +
+              "<td>" + escapeHtml(String(item.integrity_status || "")) + "</td>" +
+              "<td>" + escapeHtml(String(item.checked_at || "")) + "</td>" +
+              "</tr>"
+            ).join("") +
+            "</tbody></table></div>"
+          : "<div class='summary'>No cache integrity metadata recorded yet.</div>");
       node.className = "status-panel msg note";
       node.innerHTML = "<table><thead><tr><th>Provider</th><th>Status</th><th>Searches Today</th><th>Imports Today</th><th>Recent / Current Note</th></tr></thead><tbody>" +
         rows +
@@ -776,7 +802,8 @@ _COMPANION_HTML = """<!doctype html>
         " | default search timeout=" + escapeHtml(String(retrySettings.default_search_timeout_seconds || "")) + "s" +
         " | default download timeout=" + escapeHtml(String(retrySettings.default_download_timeout_seconds || "")) + "s</div>" +
         quarantineHtml +
-        importHistoryHtml;
+        importHistoryHtml +
+        cacheIntegrityHtml;
       renderRecentProviderErrors();
     }
 
@@ -816,6 +843,27 @@ _COMPANION_HTML = """<!doctype html>
         const node = document.getElementById("provider-diagnostics-panel");
         node.className = "status-panel msg err";
         node.textContent = "Failed to clear provider import history: " + err.message;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+
+    async function runCacheIntegrityAction(btn, endpoint, failurePrefix) {
+      const original = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Working...";
+      try {
+        const res = await fetch(endpoint, { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || failurePrefix);
+        }
+        await refreshProviderDiagnostics();
+      } catch (err) {
+        const node = document.getElementById("provider-diagnostics-panel");
+        node.className = "status-panel msg err";
+        node.textContent = failurePrefix + ": " + err.message;
       } finally {
         btn.disabled = false;
         btn.textContent = original;
@@ -1849,6 +1897,14 @@ _COMPANION_HTML = """<!doctype html>
       await clearProviderImportHistory(this);
     });
 
+    document.getElementById("scan-cache-integrity-btn").addEventListener("click", async function () {
+      await runCacheIntegrityAction(this, "/companion/cache-integrity/scan", "Failed to scan cache integrity");
+    });
+
+    document.getElementById("repair-cache-integrity-btn").addEventListener("click", async function () {
+      await runCacheIntegrityAction(this, "/companion/cache-integrity/repair-metadata", "Failed to repair cache integrity metadata");
+    });
+
     document.getElementById("import-best-btn").addEventListener("click", async function () {
       const result = document.getElementById("search-all-result");
       result.innerHTML = "";
@@ -2608,6 +2664,7 @@ def _store_imported_provider_item(
     )
     stored["import_history"] = import_history
     stored["reused_existing_record"] = False
+    stored["cache_integrity"] = None
     return stored
 
 
@@ -2640,17 +2697,29 @@ def _reuse_or_store_imported_provider_item(
     if import_summary.get("record_id"):
         existing_record = get_record(config.DB_PATH, int(import_summary["record_id"]))
     if existing_record:
-        return _reuse_existing_imported_provider_item(
-            video_id=video_id,
-            season=season,
-            episode=episode,
-            provider=provider,
-            subtitle_id=subtitle_id,
-            download_url=download_url,
-            release_name=release_name,
+        integrity = cache_integrity.verify_record(
+            config.DB_PATH,
             record_id=int(existing_record["id"]),
-            quality_metadata=inspected,
+            provider=provider,
+            release_name=release_name,
+            video_identity=_history_video_identity(identity),
+            quality_level=(inspected or {}).get("quality_level") or import_summary.get("quality_level"),
+            quality_score=(inspected or {}).get("quality_score") or import_summary.get("quality_score"),
         )
+        if _integrity_allows_immediate_local_reuse(integrity):
+            reused = _reuse_existing_imported_provider_item(
+                video_id=video_id,
+                season=season,
+                episode=episode,
+                provider=provider,
+                subtitle_id=subtitle_id,
+                download_url=download_url,
+                release_name=release_name,
+                record_id=int(existing_record["id"]),
+                quality_metadata=inspected,
+            )
+            reused["cache_integrity"] = _sanitize_cache_integrity(integrity)
+            return reused
     return _store_imported_provider_item(
         video_id=video_id,
         video_type=video_type,
@@ -2695,6 +2764,7 @@ def _reuse_existing_imported_provider_item(
         payload = merge_quality_metadata(payload, quality_metadata)
     payload["import_history"] = updated_history
     payload["reused_existing_record"] = True
+    payload["cache_integrity"] = None
     return payload
 
 
@@ -2749,6 +2819,131 @@ def _local_reuse_reason(
         "A previously imported local subtitle was reused for this title before provider search "
         "using its existing {0} quality rating."
     ).format(quality_level)
+
+
+def _verify_local_reuse_candidate(summary: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not summary:
+        return None
+    return cache_integrity.verify_import_history_summary(
+        config.DB_PATH,
+        summary,
+    )
+
+
+def _sanitize_cache_integrity(integrity: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not integrity:
+        return None
+    return {
+        "record_id": int(integrity.get("record_id") or 0) or None,
+        "integrity_status": _parse_optional_text(integrity.get("integrity_status"))
+        or cache_integrity.STATUS_STALE_RECORD,
+        "integrity_warnings": [
+            str(item) for item in (integrity.get("integrity_warnings") or []) if str(item).strip()
+        ],
+        "checked_at": _parse_optional_text(integrity.get("checked_at")),
+        "quality_level": _parse_optional_text(integrity.get("quality_level")),
+        "quality_score": integrity.get("quality_score"),
+        "quality_acceptable": bool(integrity.get("quality_acceptable")),
+    }
+
+
+def _integrity_allows_immediate_local_reuse(integrity: Optional[Dict[str, Any]]) -> bool:
+    return (
+        str((integrity or {}).get("integrity_status") or "") == cache_integrity.STATUS_VALID
+        and bool((integrity or {}).get("quality_acceptable"))
+    )
+
+
+def _integrity_allows_bad_quality_local_fallback(integrity: Optional[Dict[str, Any]]) -> bool:
+    return (
+        str((integrity or {}).get("integrity_status") or "") == cache_integrity.STATUS_VALID
+        and _parse_optional_text((integrity or {}).get("quality_level")) == "bad"
+    )
+
+
+def _integrity_failure_reason(integrity: Optional[Dict[str, Any]]) -> Optional[str]:
+    warnings = [str(item) for item in ((integrity or {}).get("integrity_warnings") or []) if str(item).strip()]
+    if warnings:
+        return "Local cached subtitle could not be reused safely. " + warnings[0]
+    if integrity:
+        return "Local cached subtitle could not be reused safely after integrity verification."
+    return None
+
+
+def _build_local_reuse_response(
+    *,
+    payload: Dict[str, Any],
+    identity: Dict[str, Any],
+    local_candidate: Dict[str, Any],
+    cache_integrity_payload: Optional[Dict[str, Any]],
+    local_first_reused: bool,
+    provider_errors: Dict[str, Any],
+    searched_providers: List[str],
+    fallback_reason: Optional[str],
+) -> JSONResponse:
+    local_record = get_record(config.DB_PATH, int(local_candidate["record_id"])) or {}
+    quality_metadata = _local_reuse_quality_metadata(local_candidate)
+    stored = _reuse_existing_imported_provider_item(
+        video_id=payload["video_id"],
+        season=identity["season"],
+        episode=identity["episode"],
+        provider=str(local_candidate.get("provider") or ""),
+        subtitle_id=_parse_optional_text(local_candidate.get("subtitle_id")),
+        download_url=str(local_record.get("source_download_url") or ""),
+        release_name=_parse_optional_text(local_candidate.get("release_name")) or payload["release_name"],
+        record_id=int(local_candidate["record_id"]),
+        quality_metadata=quality_metadata or None,
+    )
+    import_history_note = _local_reuse_reason(
+        local_candidate,
+        fallback_from_bad_quality=not local_first_reused and _parse_optional_text(local_candidate.get("quality_level")) == "bad",
+    )
+    status = stored["status"]
+    arabic_srt_path = stored["arabic_srt_path"]
+    job_id = None
+    if payload["auto_translate"] and get_gemini_status().get("configured"):
+        if payload["background_translate"]:
+            job = _start_background_translation(
+                int(stored["id"]),
+                force=bool(payload["force_translate"]),
+            )
+            status = job.get("status") or status
+            job_id = job.get("job_id")
+        else:
+            translated = _translate_record_or_raise(
+                int(stored["id"]),
+                force=bool(payload["force_translate"]),
+            )
+            status = translated.get("status") or status
+            arabic_srt_path = translated.get("arabic_srt_path")
+    return JSONResponse(
+        {
+            "record_id": stored["id"],
+            "provider": local_candidate.get("provider"),
+            "score": None,
+            "selected_reason": import_history_note,
+            "status": status,
+            "arabic_srt_path": arabic_srt_path,
+            "job_id": job_id,
+            "provider_errors": provider_errors,
+            "searched_providers": searched_providers,
+            "tried_candidates": [],
+            "fallback_reason": fallback_reason,
+            "quarantine": None,
+            "quarantine_affected_selection": False,
+            "import_history": stored.get("import_history") or local_candidate,
+            "reused_existing_record": True,
+            "import_history_note": import_history_note,
+            "quality_score": stored.get("quality_score"),
+            "quality_level": stored.get("quality_level"),
+            "quality_warnings": stored.get("quality_warnings") or [],
+            "reject_hint": bool(stored.get("reject_hint")),
+            "quality_message": stored.get("quality_message"),
+            "local_first_reused": bool(local_first_reused),
+            "local_reuse_reason": import_history_note,
+            "cache_integrity": _sanitize_cache_integrity(cache_integrity_payload),
+        }
+    )
 
 
 def _record_provider_import_history(
@@ -2968,6 +3163,7 @@ def provider_diagnostics() -> Dict[str, Any]:
         "import_history": {
             "items": provider_import_history.list_entries(config.DB_PATH),
         },
+        "cache_integrity": cache_integrity.get_summary(config.DB_PATH),
     }
 
 
@@ -3006,6 +3202,24 @@ def clear_provider_import_history_endpoint() -> Dict[str, Any]:
         "status": "cleared",
         "cleared_count": cleared_count,
     }
+
+
+@router.get("/companion/cache-integrity")
+def cache_integrity_endpoint() -> Dict[str, Any]:
+    """Return safe local cache integrity counts and latest metadata."""
+    return cache_integrity.get_summary(config.DB_PATH)
+
+
+@router.post("/companion/cache-integrity/scan")
+def cache_integrity_scan_endpoint() -> Dict[str, Any]:
+    """Scan imported cached subtitles and persist fresh integrity metadata."""
+    return cache_integrity.scan_records(config.DB_PATH, repair_metadata=False)
+
+
+@router.post("/companion/cache-integrity/repair-metadata")
+def cache_integrity_repair_metadata_endpoint() -> Dict[str, Any]:
+    """Refresh safe cache integrity metadata without deleting any records."""
+    return cache_integrity.scan_records(config.DB_PATH, repair_metadata=True)
 
 
 @router.get("/companion/install-info")
@@ -3763,6 +3977,7 @@ async def import_best(request: Request) -> JSONResponse:
         episode=payload["episode"],
     )
     local_candidate = None
+    local_candidate_integrity = None
     if not payload["force_provider_search"]:
         local_candidate = _find_local_reuse_candidate(
             video_id=payload["video_id"],
@@ -3770,90 +3985,27 @@ async def import_best(request: Request) -> JSONResponse:
             episode=identity["episode"],
             allow_bad_quality=False,
         )
+        if local_candidate:
+            local_candidate_integrity = _verify_local_reuse_candidate(local_candidate)
     search_result: Dict[str, Any] = {
         "items": [],
         "provider_errors": {},
         "searched_providers": [],
     }
     import_history_note = None
-    limit_response = _ensure_provider_search_allowed()
-    provider_status = provider_router.get_provider_status()
-    provider_ready = any(
-        bool(provider_status.get(name, {}).get("configured"))
-        for name in ("subdl", "subsource", "opensubtitles")
-    )
-    immediate_local_reuse = (
-        local_candidate is not None
-        and not payload["force_provider_search"]
-        and (
-            bool(limit_response)
-            or (
-                not provider_ready
-                and provider_router.search_all_subtitles is _ORIGINAL_SEARCH_ALL_SUBTITLES
-            )
-        )
-    )
-    if immediate_local_reuse:
-        local_record = get_record(config.DB_PATH, int(local_candidate["record_id"])) or {}
-        quality_metadata = _local_reuse_quality_metadata(local_candidate)
-        stored = _reuse_existing_imported_provider_item(
-            video_id=payload["video_id"],
-            season=identity["season"],
-            episode=identity["episode"],
-            provider=str(local_candidate.get("provider") or ""),
-            subtitle_id=_parse_optional_text(local_candidate.get("subtitle_id")),
-            download_url=str(local_record.get("source_download_url") or ""),
-            release_name=_parse_optional_text(local_candidate.get("release_name")) or payload["release_name"],
-            record_id=int(local_candidate["record_id"]),
-            quality_metadata=quality_metadata or None,
-        )
-        import_history_note = _local_reuse_reason(local_candidate)
-        status = stored["status"]
-        arabic_srt_path = stored["arabic_srt_path"]
-        job_id = None
-        if payload["auto_translate"] and get_gemini_status().get("configured"):
-            if payload["background_translate"]:
-                job = _start_background_translation(
-                    int(stored["id"]),
-                    force=bool(payload["force_translate"]),
-                )
-                status = job.get("status") or status
-                job_id = job.get("job_id")
-            else:
-                translated = _translate_record_or_raise(
-                    int(stored["id"]),
-                    force=bool(payload["force_translate"]),
-                )
-                status = translated.get("status") or status
-                arabic_srt_path = translated.get("arabic_srt_path")
-        return JSONResponse(
-            {
-                "record_id": stored["id"],
-                "provider": local_candidate.get("provider"),
-                "score": None,
-                "selected_reason": _local_reuse_reason(local_candidate),
-                "status": status,
-                "arabic_srt_path": arabic_srt_path,
-                "job_id": job_id,
-                "provider_errors": {},
-                "searched_providers": [],
-                "tried_candidates": [],
-                "fallback_reason": None,
-                "quarantine": None,
-                "quarantine_affected_selection": False,
-                "import_history": stored.get("import_history") or local_candidate,
-                "reused_existing_record": True,
-                "import_history_note": import_history_note,
-                "quality_score": stored.get("quality_score"),
-                "quality_level": stored.get("quality_level"),
-                "quality_warnings": stored.get("quality_warnings") or [],
-                "reject_hint": bool(stored.get("reject_hint")),
-                "quality_message": stored.get("quality_message"),
-                "local_first_reused": True,
-                "local_reuse_reason": _local_reuse_reason(local_candidate),
-            }
+    if local_candidate is not None and _integrity_allows_immediate_local_reuse(local_candidate_integrity):
+        return _build_local_reuse_response(
+            payload=payload,
+            identity=identity,
+            local_candidate=local_candidate,
+            cache_integrity_payload=local_candidate_integrity,
+            local_first_reused=True,
+            provider_errors={},
+            searched_providers=[],
+            fallback_reason=None,
         )
 
+    limit_response = _ensure_provider_search_allowed()
     if limit_response:
         return limit_response
     _record_provider_search_event(
@@ -3872,65 +4024,16 @@ async def import_best(request: Request) -> JSONResponse:
         release_name=payload["release_name"],
     )
     items = search_result.get("items") or []
-    if not items and local_candidate:
-        local_record = get_record(config.DB_PATH, int(local_candidate["record_id"])) or {}
-        quality_metadata = _local_reuse_quality_metadata(local_candidate)
-        stored = _reuse_existing_imported_provider_item(
-            video_id=payload["video_id"],
-            season=identity["season"],
-            episode=identity["episode"],
-            provider=str(local_candidate.get("provider") or ""),
-            subtitle_id=_parse_optional_text(local_candidate.get("subtitle_id")),
-            download_url=str(local_record.get("source_download_url") or ""),
-            release_name=_parse_optional_text(local_candidate.get("release_name")) or payload["release_name"],
-            record_id=int(local_candidate["record_id"]),
-            quality_metadata=quality_metadata or None,
-        )
-        import_history_note = _local_reuse_reason(local_candidate)
-        status = stored["status"]
-        arabic_srt_path = stored["arabic_srt_path"]
-        job_id = None
-        if payload["auto_translate"] and get_gemini_status().get("configured"):
-            if payload["background_translate"]:
-                job = _start_background_translation(
-                    int(stored["id"]),
-                    force=bool(payload["force_translate"]),
-                )
-                status = job.get("status") or status
-                job_id = job.get("job_id")
-            else:
-                translated = _translate_record_or_raise(
-                    int(stored["id"]),
-                    force=bool(payload["force_translate"]),
-                )
-                status = translated.get("status") or status
-                arabic_srt_path = translated.get("arabic_srt_path")
-        return JSONResponse(
-            {
-                "record_id": stored["id"],
-                "provider": local_candidate.get("provider"),
-                "score": None,
-                "selected_reason": import_history_note,
-                "status": status,
-                "arabic_srt_path": arabic_srt_path,
-                "job_id": job_id,
-                "provider_errors": search_result.get("provider_errors") or {},
-                "searched_providers": search_result.get("searched_providers") or [],
-                "tried_candidates": [],
-                "fallback_reason": import_history_note,
-                "quarantine": None,
-                "quarantine_affected_selection": False,
-                "import_history": stored.get("import_history") or local_candidate,
-                "reused_existing_record": True,
-                "import_history_note": import_history_note,
-                "quality_score": stored.get("quality_score"),
-                "quality_level": stored.get("quality_level"),
-                "quality_warnings": stored.get("quality_warnings") or [],
-                "reject_hint": bool(stored.get("reject_hint")),
-                "quality_message": stored.get("quality_message"),
-                "local_first_reused": False,
-                "local_reuse_reason": import_history_note,
-            }
+    if not items and local_candidate and _integrity_allows_immediate_local_reuse(local_candidate_integrity):
+        return _build_local_reuse_response(
+            payload=payload,
+            identity=identity,
+            local_candidate=local_candidate,
+            cache_integrity_payload=local_candidate_integrity,
+            local_first_reused=False,
+            provider_errors=search_result.get("provider_errors") or {},
+            searched_providers=search_result.get("searched_providers") or [],
+            fallback_reason=_local_reuse_reason(local_candidate),
         )
     if not items and not payload["force_provider_search"]:
         local_candidate = _find_local_reuse_candidate(
@@ -3939,68 +4042,24 @@ async def import_best(request: Request) -> JSONResponse:
             episode=identity["episode"],
             allow_bad_quality=True,
         )
-        if local_candidate and _parse_optional_text(local_candidate.get("quality_level")) == "bad":
-            local_record = get_record(config.DB_PATH, int(local_candidate["record_id"])) or {}
-            quality_metadata = _local_reuse_quality_metadata(local_candidate)
-            stored = _reuse_existing_imported_provider_item(
-                video_id=payload["video_id"],
-                season=identity["season"],
-                episode=identity["episode"],
-                provider=str(local_candidate.get("provider") or ""),
-                subtitle_id=_parse_optional_text(local_candidate.get("subtitle_id")),
-                download_url=str(local_record.get("source_download_url") or ""),
-                release_name=_parse_optional_text(local_candidate.get("release_name")) or payload["release_name"],
-                record_id=int(local_candidate["record_id"]),
-                quality_metadata=quality_metadata or None,
-            )
-            import_history_note = _local_reuse_reason(
-                local_candidate,
-                fallback_from_bad_quality=True,
-            )
-            status = stored["status"]
-            arabic_srt_path = stored["arabic_srt_path"]
-            job_id = None
-            if payload["auto_translate"] and get_gemini_status().get("configured"):
-                if payload["background_translate"]:
-                    job = _start_background_translation(
-                        int(stored["id"]),
-                        force=bool(payload["force_translate"]),
-                    )
-                    status = job.get("status") or status
-                    job_id = job.get("job_id")
-                else:
-                    translated = _translate_record_or_raise(
-                        int(stored["id"]),
-                        force=bool(payload["force_translate"]),
-                    )
-                    status = translated.get("status") or status
-                    arabic_srt_path = translated.get("arabic_srt_path")
-            return JSONResponse(
-                {
-                    "record_id": stored["id"],
-                    "provider": local_candidate.get("provider"),
-                    "score": None,
-                    "selected_reason": import_history_note,
-                    "status": status,
-                    "arabic_srt_path": arabic_srt_path,
-                    "job_id": job_id,
-                    "provider_errors": search_result.get("provider_errors") or {},
-                    "searched_providers": search_result.get("searched_providers") or [],
-                    "tried_candidates": [],
-                    "fallback_reason": import_history_note,
-                    "quarantine": None,
-                    "quarantine_affected_selection": False,
-                    "import_history": stored.get("import_history") or local_candidate,
-                    "reused_existing_record": True,
-                    "import_history_note": import_history_note,
-                    "quality_score": stored.get("quality_score"),
-                    "quality_level": stored.get("quality_level"),
-                    "quality_warnings": stored.get("quality_warnings") or [],
-                    "reject_hint": bool(stored.get("reject_hint")),
-                    "quality_message": stored.get("quality_message"),
-                    "local_first_reused": False,
-                    "local_reuse_reason": import_history_note,
-                }
+        local_candidate_integrity = _verify_local_reuse_candidate(local_candidate)
+        if (
+            local_candidate
+            and _parse_optional_text(local_candidate.get("quality_level")) == "bad"
+            and _integrity_allows_bad_quality_local_fallback(local_candidate_integrity)
+        ):
+            return _build_local_reuse_response(
+                payload=payload,
+                identity=identity,
+                local_candidate=local_candidate,
+                cache_integrity_payload=local_candidate_integrity,
+                local_first_reused=False,
+                provider_errors=search_result.get("provider_errors") or {},
+                searched_providers=search_result.get("searched_providers") or [],
+                fallback_reason=_local_reuse_reason(
+                    local_candidate,
+                    fallback_from_bad_quality=True,
+                ),
             )
     if not items:
         return JSONResponse(
@@ -4012,6 +4071,7 @@ async def import_best(request: Request) -> JSONResponse:
                 "fallback_reason": None,
                 "local_first_reused": False,
                 "local_reuse_reason": None,
+                "cache_integrity": _sanitize_cache_integrity(local_candidate_integrity),
             },
             status_code=404,
         )
@@ -4039,6 +4099,7 @@ async def import_best(request: Request) -> JSONResponse:
                 "quarantine_affected_selection": bool(selection.get("quarantine_affected_selection")),
                 "local_first_reused": False,
                 "local_reuse_reason": None,
+                "cache_integrity": _sanitize_cache_integrity(local_candidate_integrity),
             },
             status_code=502,
         )
@@ -4072,6 +4133,9 @@ async def import_best(request: Request) -> JSONResponse:
                     "import_history": selection.get("selected_import_history"),
                     "local_first_reused": False,
                     "local_reuse_reason": None,
+                    "cache_integrity": _sanitize_cache_integrity(
+                        local_candidate_integrity or selection.get("selected_cache_integrity")
+                    ),
                 },
                 status_code=502,
             )
@@ -4139,6 +4203,9 @@ async def import_best(request: Request) -> JSONResponse:
             "quality_message": stored.get("quality_message"),
             "local_first_reused": False,
             "local_reuse_reason": None,
+            "cache_integrity": _sanitize_cache_integrity(
+                local_candidate_integrity or stored.get("cache_integrity") or selection.get("selected_cache_integrity")
+            ),
         }
     )
 

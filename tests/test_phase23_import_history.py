@@ -69,6 +69,7 @@ def _run_import_best(
     items: list[dict],
     payload_by_url: dict[str, bytes] | None = None,
     download_side_effect=None,
+    body: dict | None = None,
 ) -> dict:
     monkeypatch.setattr(
         provider_router,
@@ -88,7 +89,10 @@ def _run_import_best(
             "download_subtitle_data",
             lambda provider, url: payload_map[url],
         )
-    response = client.post("/companion/import-best", json={"video_id": video_id})
+    payload = {"video_id": video_id}
+    if body:
+        payload.update(body)
+    response = client.post("/companion/import-best", json=payload)
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -166,6 +170,7 @@ def test_repeated_import_best_reuses_existing_record(client: TestClient, monkeyp
         download_side_effect=lambda provider, url: (_ for _ in ()).throw(
             provider_router.SubDLError("provider download should not be called for reused import")
         ),
+        body={"force_provider_search": True},
     )
 
     assert second["record_id"] == first["record_id"]
@@ -214,6 +219,7 @@ def test_different_better_candidate_can_still_be_imported(client: TestClient, mo
             "https://subdl.local/old-choice.srt": GOOD_SRT.encode("utf-8"),
             "https://subsource.local/better-choice.srt": GOOD_SRT.encode("utf-8"),
         },
+        body={"force_provider_search": True},
     )
 
     assert second["record_id"] != first["record_id"]

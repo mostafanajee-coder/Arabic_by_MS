@@ -12,8 +12,6 @@ from backend import config
 from backend.main import app
 from services import cache_db, job_manager, provider_import_history, provider_router
 
-ORIGINAL_SEARCH_ALL_SUBTITLES = provider_router.search_all_subtitles
-
 
 GOOD_SRT = (
     "1\n"
@@ -28,6 +26,15 @@ GOOD_SRT = (
     "00:00:07,000 --> 00:00:09,000\n"
     "This subtitle is valid and readable.\n"
 )
+
+
+def _configured_provider_status() -> dict:
+    return {
+        "gemini": {"configured": False, "message": "disabled"},
+        "subdl": {"configured": True, "message": "ok"},
+        "subsource": {"configured": False, "message": "disabled"},
+        "opensubtitles": {"configured": False, "message": "disabled"},
+    }
 
 
 @pytest.fixture
@@ -163,7 +170,14 @@ def test_import_best_reuses_existing_local_record_before_provider_search(client:
         payload_by_url={"https://subdl.local/local-first.srt": GOOD_SRT.encode("utf-8")},
     )
 
-    monkeypatch.setattr(provider_router, "search_all_subtitles", ORIGINAL_SEARCH_ALL_SUBTITLES)
+    monkeypatch.setattr(provider_router, "get_provider_status", _configured_provider_status)
+    monkeypatch.setattr(
+        provider_router,
+        "search_all_subtitles",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("provider search should not run when a reusable local record already exists")
+        ),
+    )
     reused = _run_import_best(client, monkeypatch, video_id="tt2400001", items=None)
 
     assert reused["record_id"] == seeded["record_id"]

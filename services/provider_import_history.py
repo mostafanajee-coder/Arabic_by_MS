@@ -247,19 +247,28 @@ def get_candidate_summary(
     return _build_summary(key, history_row, record)
 
 
-def list_entries(db_path: PathLike, *, limit: int = 50) -> List[Dict[str, Any]]:
+def list_entries(db_path: PathLike, *, limit: Optional[int] = 50) -> List[Dict[str, Any]]:
     """Return recent provider import history rows, newest first."""
-    normalized_limit = max(1, int(limit or 50))
     with _connect(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM provider_import_history
-            ORDER BY last_imported_at DESC, import_count DESC, id DESC
-            LIMIT ?
-            """,
-            (normalized_limit,),
-        ).fetchall()
+        if limit is None:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM provider_import_history
+                ORDER BY last_imported_at DESC, import_count DESC, id DESC
+                """
+            ).fetchall()
+        else:
+            normalized_limit = max(1, int(limit or 50))
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM provider_import_history
+                ORDER BY last_imported_at DESC, import_count DESC, id DESC
+                LIMIT ?
+                """,
+                (normalized_limit,),
+            ).fetchall()
     items: List[Dict[str, Any]] = []
     for row in rows:
         item = dict(row)

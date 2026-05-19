@@ -137,6 +137,76 @@ def test_orphan_arabic_file_detection() -> None:
     )
 
 
+def test_sample_arabic_asset_is_protected_and_fallback_download_still_works(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    sample_path = config.ARABIC_CACHE_DIR / config.SAMPLE_SRT_NAME
+    sample_path.parent.mkdir(parents=True, exist_ok=True)
+    sample_path.write_text(ARABIC_SRT, encoding="utf-8")
+    monkeypatch.setattr(config, "SAMPLE_SRT_PATH", sample_path)
+
+    summary = cache_maintenance.scan_cache(
+        config.DB_PATH,
+        english_cache_dir=config.ENGLISH_CACHE_DIR,
+        arabic_cache_dir=config.ARABIC_CACHE_DIR,
+    )
+
+    assert _contains_path(summary["protected_files"], sample_path)
+    assert any(
+        str(item.get("path") or "") == str(sample_path.resolve())
+        and str(item.get("reason") or "") == "Bundled project cache asset."
+        for item in summary["protected_files"]
+    )
+    assert not any(
+        str(item.get("path") or "") == str(sample_path.resolve())
+        and item["action"] == cache_maintenance.CLEANUP_ACTION_DELETE_CANDIDATE
+        for item in summary["cleanup_candidates"]
+    )
+
+    result = cache_maintenance.cleanup_cache(
+        config.DB_PATH,
+        english_cache_dir=config.ENGLISH_CACHE_DIR,
+        arabic_cache_dir=config.ARABIC_CACHE_DIR,
+        dry_run=False,
+        allow_delete=True,
+    )
+
+    assert sample_path.exists()
+    assert not any(str(item.get("path") or "") == str(sample_path.resolve()) for item in result["deleted_files"])
+
+    response = client.get("/download/arabic-ms-fallback.srt")
+    assert response.status_code == 200
+    assert "-->" in response.text
+
+
+def test_gitkeep_placeholder_is_protected(monkeypatch) -> None:
+    sample_path = config.ARABIC_CACHE_DIR / config.SAMPLE_SRT_NAME
+    sample_path.parent.mkdir(parents=True, exist_ok=True)
+    sample_path.write_text(ARABIC_SRT, encoding="utf-8")
+    monkeypatch.setattr(config, "SAMPLE_SRT_PATH", sample_path)
+    placeholder = config.ARABIC_CACHE_DIR / ".gitkeep"
+    placeholder.parent.mkdir(parents=True, exist_ok=True)
+    placeholder.write_text("", encoding="utf-8")
+
+    result = cache_maintenance.cleanup_cache(
+        config.DB_PATH,
+        english_cache_dir=config.ENGLISH_CACHE_DIR,
+        arabic_cache_dir=config.ARABIC_CACHE_DIR,
+        dry_run=False,
+        allow_delete=True,
+    )
+
+    assert placeholder.exists()
+    assert _contains_path(result["protected_files"], placeholder)
+    assert not any(
+        str(item.get("path") or "") == str(placeholder.resolve())
+        and item["action"] == cache_maintenance.CLEANUP_ACTION_DELETE_CANDIDATE
+        for item in result["cleanup_candidates"]
+    )
+    assert not any(str(item.get("path") or "") == str(placeholder.resolve()) for item in result["deleted_files"])
+
+
 def test_referenced_valid_files_are_protected(client: TestClient, monkeypatch) -> None:
     seeded = _run_import_best(
         client,
@@ -374,4 +444,3 @@ def test_cache_maintenance_endpoints_do_not_expose_srt_text_or_secrets(
     assert "Hello there" not in serialized
     assert "secret-subdl-key" not in serialized
     assert "secret-os-key" not in serialized
-

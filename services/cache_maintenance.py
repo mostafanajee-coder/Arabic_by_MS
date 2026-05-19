@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
+from backend import config
 from services import batch_prepare_service, cache_db, cache_integrity, job_manager
 
 PathLike = Union[str, Path]
@@ -93,6 +94,18 @@ def scan_cache(
     for file_info in all_files:
         path_text = file_info["path"]
         language = str(file_info["language"])
+        managed_reason = _project_managed_asset_reason(Path(path_text))
+        if managed_reason:
+            protected_files.append(
+                _file_entry(
+                    path_text,
+                    reason=managed_reason,
+                    size_bytes=file_info["size_bytes"],
+                    protected=True,
+                    language=language,
+                )
+            )
+            continue
         referenced_set = referenced_english if language == "english" else referenced_arabic
         if path_text in referenced_set:
             protected_files.append(
@@ -622,6 +635,16 @@ def _safe_file_size(path: Path) -> Optional[int]:
         return int(path.stat().st_size)
     except OSError:
         return None
+
+
+def _project_managed_asset_reason(path: Path) -> Optional[str]:
+    resolved = path.resolve(strict=False)
+    sample_path = config.SAMPLE_SRT_PATH.resolve(strict=False)
+    if resolved == sample_path:
+        return "Bundled project cache asset."
+    if path.name == ".gitkeep":
+        return "Bundled cache placeholder file."
+    return None
 
 
 def _is_path_within_root(path: Path, root: Path) -> bool:

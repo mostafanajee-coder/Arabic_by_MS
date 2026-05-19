@@ -20,6 +20,14 @@ Phase 23: adds provider subtitle import history and duplicate-import prevention.
 Phase 24: adds local-first subtitle reuse before provider search when safe.
 Phase 25: adds cache integrity verification before cached local reuse.
 Phase 26: adds safe cache maintenance scanning and orphan cleanup planning.
+Phase 27: adds recycle-bin cleanup moves and safe cache restore support.
+Phase 28: adds recycle-bin integrity verification and cache maintenance audit trails.
+Phase 29: adds maintenance safety policy classification and operator approval gates.
+Phase 30: adds maintenance snapshots for before/after metadata traceability.
+Phase 31: adds metadata-only rollback planning for maintenance snapshots.
+Phase 32: adds controlled rollback execution for cleanup snapshots with confirmation gates.
+Phase 33: adds operator workflow summary, readiness metadata, and final maintenance safety UX polish.
+Phase 34: adds a final read-only readiness gate and deep regression/torture validation workflow.
 """
 
 from __future__ import annotations
@@ -68,10 +76,10 @@ DB_PATH: Path = CACHE_DIR / "subtitles.db"
 
 ADDON_ID: str = os.getenv("ADDON_ID", "community.arabic.by.ms")
 ADDON_NAME: str = os.getenv("ADDON_NAME", "Arabic by M.S")
-ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.26.0")
+ADDON_VERSION: str = os.getenv("ADDON_VERSION", "0.34.0")
 ADDON_DESCRIPTION: str = os.getenv(
     "ADDON_DESCRIPTION",
-    "Arabic subtitles for Stremio. Phase 26 keeps the Phase 25 cache integrity verification, Phase 24 local-first subtitle reuse, Phase 23 import history, Phase 22 quarantine memory, Phase 21 quality-aware fallback, Phase 20 subtitle quality inspection, Phase 19 match intelligence, Phase 18 provider reliability, and Phase 17 OpenSubtitles behavior, and adds safe cache maintenance scanning and orphan cleanup planning.",
+    "Arabic subtitles for Stremio. Phase 34 keeps the Phase 33 operator maintenance workflow, Phase 32 controlled rollback execution, Phase 31 rollback planning, Phase 30 maintenance snapshots, Phase 29 maintenance safety policy and operator approval gates, Phase 28 recycle checksum and audit behavior, Phase 27 recycle-bin move and restore behavior, Phase 26 protected cache maintenance behavior, Phase 25 cache integrity verification, Phase 24 local-first subtitle reuse, Phase 23 import history, Phase 22 quarantine memory, Phase 21 quality-aware fallback, Phase 20 subtitle quality inspection, Phase 19 match intelligence, Phase 18 provider reliability, and Phase 17 OpenSubtitles behavior, and adds a final read-only readiness gate for deep regression validation.",
 )
 
 # ---------------------------------------------------------------------------

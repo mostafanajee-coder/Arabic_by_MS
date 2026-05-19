@@ -19,6 +19,7 @@ from services import (
     batch_prepare_service,
     cache_maintenance,
     cache_integrity,
+    final_readiness,
     gemini_service,
     job_manager,
     opensubtitles_service,
@@ -117,6 +118,12 @@ _COMPANION_HTML = """<!doctype html>
     .actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
     .check-row { margin-top: 0.9rem; display: flex; align-items: center; }
     .summary { margin-top: 0.75rem; }
+    .maintenance-control-center { border: 1px solid #cbd5e1; background: #f8fafc; }
+    .maintenance-group-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0.8rem; margin-top: 0.8rem; }
+    .maintenance-group-card { border: 1px solid #dbe4ef; border-radius: 6px; padding: 0.6rem; background: #ffffff; }
+    .maintenance-group-card .summary { margin-top: 0.4rem; }
+    .maintenance-kv { display: grid; grid-template-columns: 220px 1fr; gap: 0.35rem 0.6rem; font-size: 0.9rem; }
+    .maintenance-kv code { word-break: break-word; }
   </style>
 </head>
 <body>
@@ -139,6 +146,13 @@ _COMPANION_HTML = """<!doctype html>
   <div id="subdl-status" class="status-panel msg">Checking SubDL configuration...</div>
   <div id="subsource-status" class="status-panel msg">Checking SubSource configuration...</div>
   <div id="opensubtitles-status" class="status-panel msg">Checking OpenSubtitles configuration...</div>
+  <div id="final-readiness-panel" class="status-panel msg note">
+    <strong>Final Readiness</strong>
+    <div class="summary">Loading readiness gate...</div>
+    <div class="actions" style="margin-top:0.6rem;">
+      <button type="button" id="run-final-readiness-btn" class="secondary">Run readiness check</button>
+    </div>
+  </div>
 
   <div class="section">
     <h2>Provider Diagnostics</h2>
@@ -154,8 +168,29 @@ _COMPANION_HTML = """<!doctype html>
         <input id="allow-cache-maintenance-delete" type="checkbox" />
         Allow actual orphan cleanup
       </label>
+      <button type="button" id="scan-cache-recycle-integrity-btn" class="secondary">Recycle Integrity Scan</button>
+      <input id="cache-recycle-restore-key" placeholder="Recycle item id or checksum" style="max-width: 260px;" />
+      <button type="button" id="restore-cache-recycle-btn" class="secondary">Restore recycled file</button>
+      <button type="button" id="empty-cache-recycle-btn" class="secondary">Empty recycle bin</button>
+      <label style="font-size:0.85rem; display:flex; align-items:center; gap:0.35rem;">
+        <input id="allow-cache-recycle-empty" type="checkbox" />
+        Allow empty recycle bin
+      </label>
+      <input id="cache-recycle-empty-confirmation" placeholder="Type EMPTY RECYCLE BIN" style="max-width: 240px;" />
     </div>
+    <div id="maintenance-control-center-panel" class="status-panel msg note maintenance-control-center">Loading maintenance control center...</div>
     <div id="provider-diagnostics-panel" class="status-panel msg note">Loading provider diagnostics...</div>
+    <div class="maintenance-group-grid">
+      <div class="maintenance-group-card">
+        <div id="cache-maintenance-policy-panel" class="status-panel msg note">Loading safety policy...</div>
+      </div>
+      <div class="maintenance-group-card">
+        <div id="cache-maintenance-audit-panel" class="status-panel msg note">Loading audit trail...</div>
+      </div>
+      <div class="maintenance-group-card">
+        <div id="cache-maintenance-snapshots-panel" class="status-panel msg note">Loading maintenance snapshots...</div>
+      </div>
+    </div>
     <div id="provider-error-log" class="empty">No recent provider issues.</div>
   </div>
 
@@ -760,6 +795,8 @@ _COMPANION_HTML = """<!doctype html>
       const staleRecords = Array.isArray(cacheMaintenance.stale_records) ? cacheMaintenance.stale_records : [];
       const invalidIntegrityRecords = Array.isArray(cacheMaintenance.invalid_integrity_records) ? cacheMaintenance.invalid_integrity_records : [];
       const cleanupCandidates = Array.isArray(cacheMaintenance.cleanup_candidates) ? cacheMaintenance.cleanup_candidates : [];
+      const recycleBin = data.cache_recycle_bin || {};
+      const recycleItems = Array.isArray(recycleBin.items) ? recycleBin.items : [];
       const providerNames = ["gemini", "subdl", "subsource", "opensubtitles"];
       const rows = providerNames.map(name => {
         const status = providers[name] || {};
@@ -840,6 +877,23 @@ _COMPANION_HTML = """<!doctype html>
             ).join("") +
             "</tbody></table></div>"
           : "<div class='summary'>No cache maintenance cleanup candidates recorded yet.</div>");
+      const recycleBinHtml = "<div class='summary'><strong>Recycle Bin</strong>: " +
+        "recycled_files=" + escapeHtml(String(recycleBin.count || 0)) +
+        " | total size=" + escapeHtml(formatBytes(recycleBin.total_bytes || 0)) +
+        " | last recycled=" + escapeHtml(String(recycleBin.last_recycled_at || "never")) +
+        "</div>" +
+        (recycleItems.length
+          ? "<div class='summary'><table><thead><tr><th>ID</th><th>Original Path</th><th>Size</th><th>Recycled (UTC)</th></tr></thead><tbody>" +
+            recycleItems.slice(0, 10).map(item =>
+              "<tr>" +
+              "<td><code>" + escapeHtml(String(item.id || "")) + "</code></td>" +
+              "<td>" + escapeHtml(String(item.original_path || "")) + "</td>" +
+              "<td>" + escapeHtml(formatBytes(item.size_bytes || 0)) + "</td>" +
+              "<td>" + escapeHtml(String(item.recycled_at || "")) + "</td>" +
+              "</tr>"
+            ).join("") +
+            "</tbody></table></div>"
+          : "<div class='summary'>Recycle bin is empty.</div>");
       node.className = "status-panel msg note";
       node.innerHTML = "<table><thead><tr><th>Provider</th><th>Status</th><th>Searches Today</th><th>Imports Today</th><th>Recent / Current Note</th></tr></thead><tbody>" +
         rows +
@@ -851,8 +905,350 @@ _COMPANION_HTML = """<!doctype html>
         quarantineHtml +
         importHistoryHtml +
         cacheIntegrityHtml +
-        cacheMaintenanceHtml;
+        cacheMaintenanceHtml +
+        recycleBinHtml;
       renderRecentProviderErrors();
+    }
+
+    function formatAuditCounts(counts) {
+      const entries = Object.entries(counts || {}).filter(([, value]) => value !== null && value !== undefined && String(value) !== "");
+      if (!entries.length) {
+        return "none";
+      }
+      return entries.slice(0, 4).map(([key, value]) => key + "=" + String(value)).join(" | ");
+    }
+
+    function renderMaintenanceControlCenter(data) {
+      const node = document.getElementById("maintenance-control-center-panel");
+      const maintenanceCounts = (data || {}).maintenance_counts || {};
+      const recycleCounts = (data || {}).recycle_bin_counts || {};
+      const pending = Array.isArray((data || {}).pending_risky_actions) ? data.pending_risky_actions : [];
+      const recommended = (data || {}).recommended_next_action || {};
+      const latestPending = pending.length ? pending[0] : null;
+      const pendingText = latestPending
+        ? (String(latestPending.action || "action") + " | ready=" + String(Boolean(latestPending.action_ready)) +
+          " | policy=" + String(latestPending.policy_level || "") +
+          " | reason=" + String(latestPending.readiness_reason || ""))
+        : "No risky action pending.";
+      node.className = "status-panel msg note maintenance-control-center";
+      node.innerHTML =
+        "<strong>Maintenance Control Center</strong>" +
+        "<div class='summary'>Compact operator view for scan, cleanup, recycle, restore, rollback, and confirmation gates.</div>" +
+        "<div class='maintenance-kv'>" +
+          "<div><strong>Current Cache Status</strong></div><div>orphan_files=" + escapeHtml(String(maintenanceCounts.orphan_files || 0)) +
+            " | cleanup_candidates=" + escapeHtml(String(maintenanceCounts.cleanup_candidates || 0)) +
+            " | missing_references=" + escapeHtml(String(maintenanceCounts.missing_references || 0)) + "</div>" +
+          "<div><strong>Recycle Bin Status</strong></div><div>active_items=" + escapeHtml(String(recycleCounts.active_items || 0)) +
+            " | total_size=" + escapeHtml(formatBytes(recycleCounts.total_bytes || 0)) +
+            " | last_recycled=" + escapeHtml(String(recycleCounts.last_recycled_at || "never")) + "</div>" +
+          "<div><strong>Latest Risky/Pending</strong></div><div>" + escapeHtml(pendingText) + "</div>" +
+          "<div><strong>Recommended Next Action</strong></div><div><code>" + escapeHtml(String(recommended.code || "")) +
+            "</code> | " + escapeHtml(String(recommended.reason || "No recommendation available.")) + "</div>" +
+        "</div>";
+    }
+
+    function renderFinalReadiness(data) {
+      const node = document.getElementById("final-readiness-panel");
+      const blocked = Array.isArray((data || {}).blocking_issues) ? data.blocking_issues : [];
+      const warnings = Array.isArray((data || {}).warnings) ? data.warnings : [];
+      const status = String((data || {}).readiness_status || "warning");
+      const score = Number((data || {}).readiness_score || 0);
+      const statusClass = status === "ready" ? "ok" : (status === "blocked" ? "err" : "note");
+      node.className = "status-panel msg " + statusClass;
+      node.innerHTML =
+        "<strong>Final Readiness</strong>" +
+        "<div class='summary'>status=" + escapeHtml(status) +
+        " | score=" + escapeHtml(String(score)) +
+        " | blocking=" + escapeHtml(String(blocked.length)) +
+        " | warnings=" + escapeHtml(String(warnings.length)) + "</div>" +
+        "<div class='summary'>Generated at (UTC): " + escapeHtml(String((data || {}).generated_at || "")) + "</div>" +
+        "<div class='summary'>" +
+          (blocked.length ? ("Blocking: " + escapeHtml(String(blocked[0].section || "") + " - " + String(blocked[0].message || ""))) : "No blocking issues.") +
+        "</div>" +
+        "<div class='summary'>" +
+          (warnings.length ? ("Warning: " + escapeHtml(String(warnings[0].section || "") + " - " + String(warnings[0].message || ""))) : "No warnings.") +
+        "</div>" +
+        "<div class='actions' style='margin-top:0.6rem;'>" +
+          "<button type='button' id='run-final-readiness-btn' class='secondary'>Run readiness check</button>" +
+        "</div>";
+      document.getElementById("run-final-readiness-btn").addEventListener("click", async function () {
+        await runFinalReadiness(this);
+      });
+    }
+
+    function renderAuditTrail(data) {
+      const node = document.getElementById("cache-maintenance-audit-panel");
+      const items = Array.isArray((data || {}).items) ? data.items : [];
+      node.className = "status-panel msg note";
+      if (!items.length) {
+        node.innerHTML = "<strong>Audit Trail</strong><div class='summary'>No cache maintenance actions recorded yet.</div>";
+        return;
+      }
+      node.innerHTML = "<strong>Audit Trail</strong>" +
+        "<div class='summary'>latest_actions=" + escapeHtml(String(items.length)) + "</div>" +
+        "<table><thead><tr><th>Timestamp (UTC)</th><th>Action</th><th>Status</th><th>Counts</th><th>Item</th></tr></thead><tbody>" +
+        items.slice(0, 8).map(item =>
+          "<tr>" +
+          "<td>" + escapeHtml(String(item.timestamp || "")) + "</td>" +
+          "<td>" + escapeHtml(String(item.action || "")) + "</td>" +
+          "<td>" + escapeHtml(String(item.status || "")) + "</td>" +
+          "<td>" + escapeHtml(formatAuditCounts(item.counts || {})) + "</td>" +
+          "<td><code>" + escapeHtml(String(item.recycle_item_id || "")) + "</code></td>" +
+          "</tr>"
+        ).join("") +
+        "</tbody></table>";
+    }
+
+    function renderMaintenanceSnapshots(data) {
+      const node = document.getElementById("cache-maintenance-snapshots-panel");
+      const items = Array.isArray((data || {}).items) ? data.items : [];
+      node.className = "status-panel msg note";
+      if (!items.length) {
+        node.innerHTML = "<strong>Maintenance Snapshots</strong><div class='summary'>No maintenance snapshots recorded yet.</div>";
+        return;
+      }
+      node.innerHTML = "<strong>Maintenance Snapshots</strong>" +
+        "<div class='summary'>latest_snapshots=" + escapeHtml(String(items.length)) + "</div>" +
+        "<table><thead><tr><th>Created (UTC)</th><th>Action</th><th>Status</th><th>Affected</th><th>Actions</th></tr></thead><tbody>" +
+        items.slice(0, 8).map(item =>
+          "<tr>" +
+          "<td>" + escapeHtml(String(item.created_at || "")) + "</td>" +
+          "<td>" + escapeHtml(String(item.action || "")) + "</td>" +
+          "<td>" + escapeHtml(String(item.result_status || "")) + "</td>" +
+          "<td>" + escapeHtml(String(item.affected_count || 0)) + "</td>" +
+          "<td>" +
+          "<button type='button' class='secondary snapshot-view-btn' data-snapshot-id='" + escapeHtml(String(item.snapshot_id || "")) + "'>View</button> " +
+          "<button type='button' class='secondary snapshot-compare-btn' data-snapshot-id='" + escapeHtml(String(item.snapshot_id || "")) + "'>Compare</button> " +
+          "<button type='button' class='secondary snapshot-rollback-btn' data-snapshot-id='" + escapeHtml(String(item.snapshot_id || "")) + "' data-snapshot-action='" + escapeHtml(String(item.action || "")) + "'>Rollback Plan</button>" +
+          (String(item.action || "") === "cleanup"
+            ? " <button type='button' class='secondary snapshot-rollback-execute-btn' data-snapshot-id='" + escapeHtml(String(item.snapshot_id || "")) + "'>Execute Rollback</button>"
+            : "") +
+          "</td>" +
+          "</tr>"
+        ).join("") +
+        "</tbody></table>";
+      node.querySelectorAll(".snapshot-view-btn").forEach((btn) => {
+        btn.addEventListener("click", async function () {
+          await viewSnapshot(this.dataset.snapshotId || "");
+        });
+      });
+      node.querySelectorAll(".snapshot-compare-btn").forEach((btn) => {
+        btn.addEventListener("click", async function () {
+          await compareSnapshot(this.dataset.snapshotId || "");
+        });
+      });
+      node.querySelectorAll(".snapshot-rollback-btn").forEach((btn) => {
+        btn.addEventListener("click", async function () {
+          await rollbackPlanSnapshot(this.dataset.snapshotId || "");
+        });
+      });
+      node.querySelectorAll(".snapshot-rollback-execute-btn").forEach((btn) => {
+        btn.addEventListener("click", async function () {
+          await executeRollbackSnapshot(this.dataset.snapshotId || "");
+        });
+      });
+    }
+
+    async function viewSnapshot(snapshotId) {
+      if (!snapshotId) {
+        return;
+      }
+      const node = document.getElementById("provider-diagnostics-panel");
+      try {
+        const res = await fetch("/companion/cache-maintenance/snapshots/" + encodeURIComponent(snapshotId));
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "Failed to load snapshot");
+        }
+        const countsBefore = formatAuditCounts(data.counts_before || {});
+        const countsAfter = formatAuditCounts(data.counts_after || {});
+        const affectedPaths = Array.isArray(data.affected_paths) ? data.affected_paths : [];
+        node.className = "status-panel msg note";
+        node.innerHTML = "<strong>Snapshot " + escapeHtml(String(data.snapshot_id || "")) + "</strong>" +
+          "<div class='summary'>action=" + escapeHtml(String(data.action || "")) +
+          " | status=" + escapeHtml(String(data.result_status || "")) +
+          " | policy=" + escapeHtml(String(data.policy_level || "")) +
+          " | audit_id=" + escapeHtml(String(data.audit_id || "")) + "</div>" +
+          "<div class='summary'>before: " + escapeHtml(countsBefore) + "</div>" +
+          "<div class='summary'>after: " + escapeHtml(countsAfter) + "</div>" +
+          "<div class='summary'>affected paths: " + escapeHtml(affectedPaths.slice(0, 8).join(" | ")) + "</div>";
+      } catch (err) {
+        node.className = "status-panel msg err";
+        node.textContent = "Failed to view snapshot: " + err.message;
+      }
+    }
+
+    async function compareSnapshot(snapshotId) {
+      if (!snapshotId) {
+        return;
+      }
+      const node = document.getElementById("provider-diagnostics-panel");
+      try {
+        const res = await fetch("/companion/cache-maintenance/snapshots/compare", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ snapshot_id: snapshotId }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "Failed to compare snapshot");
+        }
+        const beforeCounts = formatAuditCounts(data.before_counts || {});
+        const afterCounts = formatAuditCounts(data.after_counts || {});
+        const delta = formatAuditCounts(data.delta || {});
+        node.className = "status-panel msg note";
+        node.innerHTML = "<strong>Snapshot Compare</strong>" +
+          "<div class='summary'>snapshot_id=" + escapeHtml(String(data.snapshot_id || "")) +
+          " | mode=" + escapeHtml(String(data.comparison_mode || "")) +
+          " | status=" + escapeHtml(String(data.result_status || "")) + "</div>" +
+          "<div class='summary'>before: " + escapeHtml(beforeCounts) + "</div>" +
+          "<div class='summary'>after: " + escapeHtml(afterCounts) + "</div>" +
+          "<div class='summary'>delta: " + escapeHtml(delta) + "</div>";
+      } catch (err) {
+        node.className = "status-panel msg err";
+        node.textContent = "Failed to compare snapshot: " + err.message;
+      }
+    }
+
+    async function rollbackPlanSnapshot(snapshotId) {
+      if (!snapshotId) {
+        return;
+      }
+      const node = document.getElementById("provider-diagnostics-panel");
+      try {
+        const res = await fetch("/companion/cache-maintenance/rollback-plan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ snapshot_id: snapshotId }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "Failed to build rollback plan");
+        }
+        const warnings = Array.isArray(data.rollback_warnings) ? data.rollback_warnings : [];
+        const candidateCount = Array.isArray(data.candidate_items) ? data.candidate_items.length : 0;
+        const blockedCount = (Array.isArray(data.blocked_items) ? data.blocked_items.length : 0) +
+          (Array.isArray(data.missing_items) ? data.missing_items.length : 0) +
+          (Array.isArray(data.tampered_items) ? data.tampered_items.length : 0);
+        node.className = "status-panel msg note";
+        node.innerHTML = "<strong>Rollback Plan</strong>" +
+          "<div class='summary'>snapshot_id=" + escapeHtml(String(data.snapshot_id || "")) +
+          " | action=" + escapeHtml(String(data.action || "")) +
+          " | rollback_level=" + escapeHtml(String(data.rollback_level || "")) + "</div>" +
+          "<div class='summary'>restorable_count=" + escapeHtml(String(candidateCount)) +
+          " | blocked_count=" + escapeHtml(String(blockedCount)) + "</div>" +
+          "<div class='summary'>warnings: " + escapeHtml(warnings.join(" | ")) + "</div>";
+      } catch (err) {
+        node.className = "status-panel msg err";
+        node.textContent = "Failed to build rollback plan: " + err.message;
+      }
+    }
+
+    async function executeRollbackSnapshot(snapshotId) {
+      if (!snapshotId) {
+        return;
+      }
+      const node = document.getElementById("provider-diagnostics-panel");
+      try {
+        const dryRunRes = await fetch("/companion/cache-maintenance/rollback-execute", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            snapshot_id: snapshotId,
+            dry_run: true,
+            allow_rollback: false
+          }),
+        });
+        const dryRunData = await dryRunRes.json();
+        if (!dryRunRes.ok) {
+          throw new Error(dryRunData.detail || "Failed to build rollback dry-run");
+        }
+        const dryWarnings = Array.isArray(dryRunData.safety_warnings) ? dryRunData.safety_warnings : [];
+        const dryRestorable = Array.isArray(dryRunData.candidate_items) ? dryRunData.candidate_items.length : 0;
+        const dryBlocked = (Array.isArray(dryRunData.blocked_items) ? dryRunData.blocked_items.length : 0) +
+          (Array.isArray(dryRunData.missing_items) ? dryRunData.missing_items.length : 0) +
+          (Array.isArray(dryRunData.tampered_items) ? dryRunData.tampered_items.length : 0);
+        node.className = "status-panel msg note";
+        node.innerHTML = "<strong>Rollback Dry-Run</strong>" +
+          "<div class='summary'>snapshot_id=" + escapeHtml(String(dryRunData.snapshot_id || "")) +
+          " | execution_status=" + escapeHtml(String(dryRunData.execution_status || "")) +
+          " | rollback_level=" + escapeHtml(String(dryRunData.rollback_level || "")) + "</div>" +
+          "<div class='summary'>restorable_count=" + escapeHtml(String(dryRestorable)) +
+          " | blocked_count=" + escapeHtml(String(dryBlocked)) + "</div>" +
+          "<div class='summary'>warnings: " + escapeHtml(dryWarnings.join(" | ")) + "</div>";
+
+        if (String(dryRunData.execution_status || "") === "blocked" || String(dryRunData.execution_status || "") === "not_executable") {
+          return;
+        }
+        const confirmationText = window.prompt("Type EXECUTE ROLLBACK to run rollback execution for this cleanup snapshot:");
+        if (confirmationText !== "EXECUTE ROLLBACK") {
+          return;
+        }
+        const executeRes = await fetch("/companion/cache-maintenance/rollback-execute", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            snapshot_id: snapshotId,
+            dry_run: false,
+            allow_rollback: true,
+            confirmation_text: confirmationText
+          }),
+        });
+        const executeData = await executeRes.json();
+        if (!executeRes.ok) {
+          throw new Error(executeData.detail || "Failed to execute rollback");
+        }
+        const restoredCount = Array.isArray(executeData.restored_items) ? executeData.restored_items.length : 0;
+        const blockedCount = (Array.isArray(executeData.blocked_items) ? executeData.blocked_items.length : 0) +
+          (Array.isArray(executeData.missing_items) ? executeData.missing_items.length : 0) +
+          (Array.isArray(executeData.tampered_items) ? executeData.tampered_items.length : 0) +
+          (Array.isArray(executeData.skipped_items) ? executeData.skipped_items.length : 0);
+        const warnings = Array.isArray(executeData.safety_warnings) ? executeData.safety_warnings : [];
+        node.className = "status-panel msg note";
+        node.innerHTML = "<strong>Rollback Execution</strong>" +
+          "<div class='summary'>snapshot_id=" + escapeHtml(String(executeData.snapshot_id || "")) +
+          " | execution_status=" + escapeHtml(String(executeData.execution_status || "")) +
+          " | rollback_level=" + escapeHtml(String(executeData.rollback_level || "")) + "</div>" +
+          "<div class='summary'>restored_count=" + escapeHtml(String(restoredCount)) +
+          " | blocked_count=" + escapeHtml(String(blockedCount)) +
+          " | audit_id=" + escapeHtml(String(executeData.audit_id || "")) + "</div>" +
+          "<div class='summary'>warnings: " + escapeHtml(warnings.join(" | ")) + "</div>";
+        await refreshProviderDiagnostics();
+        await refreshMaintenanceControlCenter();
+        await refreshFinalReadiness();
+        await refreshSafetyPolicy();
+        await refreshAuditTrail();
+        await refreshMaintenanceSnapshots();
+      } catch (err) {
+        node.className = "status-panel msg err";
+        node.textContent = "Failed to execute rollback: " + err.message;
+      }
+    }
+
+    function renderPolicySnapshot(data) {
+      const node = document.getElementById("cache-maintenance-policy-panel");
+      const actions = [
+        ["Scan", (data || {}).scan || {}],
+        ["Dry-run Cleanup", (data || {}).cleanup_dry_run || {}],
+        ["Recycle Cleanup", (data || {}).cleanup_recycle || {}],
+        ["Restore", (data || {}).restore || {}],
+        ["Empty Recycle Bin", (data || {}).empty_recycle_bin || {}]
+      ];
+      node.className = "status-panel msg note";
+      node.innerHTML = "<strong>Safety Policy</strong>" +
+        "<div class='summary'>Review the current safety class before cleanup, restore, or empty actions.</div>" +
+        "<table><thead><tr><th>Action</th><th>Policy</th><th>Confirmation</th><th>Warnings / Block</th></tr></thead><tbody>" +
+        actions.map(([label, item]) => {
+          const warnings = Array.isArray(item.safety_warnings) ? item.safety_warnings : [];
+          const warningText = item.blocked_reason || (warnings.length ? warnings.join(" | ") : "");
+          return "<tr>" +
+            "<td>" + escapeHtml(label) + "</td>" +
+            "<td>" + escapeHtml(String(item.policy_level || "")) + "</td>" +
+            "<td>" + escapeHtml(item.requires_confirmation ? String(item.required_confirmation_text || "required") : "none") + "</td>" +
+            "<td>" + escapeHtml(warningText) + "</td>" +
+            "</tr>";
+        }).join("") +
+        "</tbody></table>";
     }
 
     async function clearProviderQuarantine(btn) {
@@ -908,6 +1304,11 @@ _COMPANION_HTML = """<!doctype html>
           throw new Error(data.detail || failurePrefix);
         }
         await refreshProviderDiagnostics();
+        await refreshMaintenanceControlCenter();
+        await refreshFinalReadiness();
+        await refreshSafetyPolicy();
+        await refreshAuditTrail();
+        await refreshMaintenanceSnapshots();
       } catch (err) {
         const node = document.getElementById("provider-diagnostics-panel");
         node.className = "status-panel msg err";
@@ -933,6 +1334,40 @@ _COMPANION_HTML = """<!doctype html>
           throw new Error(data.detail || failurePrefix);
         }
         await refreshProviderDiagnostics();
+        await refreshMaintenanceControlCenter();
+        await refreshSafetyPolicy();
+        await refreshAuditTrail();
+        await refreshMaintenanceSnapshots();
+      } catch (err) {
+        const node = document.getElementById("provider-diagnostics-panel");
+        node.className = "status-panel msg err";
+        node.textContent = failurePrefix + ": " + err.message;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+
+    async function runCacheRecycleAction(btn, endpoint, failurePrefix, payload) {
+      const original = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Working...";
+      try {
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload || {}),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || failurePrefix);
+        }
+        await refreshProviderDiagnostics();
+        await refreshMaintenanceControlCenter();
+        await refreshFinalReadiness();
+        await refreshSafetyPolicy();
+        await refreshAuditTrail();
+        await refreshMaintenanceSnapshots();
       } catch (err) {
         const node = document.getElementById("provider-diagnostics-panel");
         node.className = "status-panel msg err";
@@ -1049,6 +1484,113 @@ _COMPANION_HTML = """<!doctype html>
       }
     }
 
+    async function refreshAuditTrail() {
+      try {
+        const res = await fetch("/companion/cache-maintenance/audit?limit=8");
+        const data = await res.json();
+        renderAuditTrail(data);
+      } catch (err) {
+        const node = document.getElementById("cache-maintenance-audit-panel");
+        node.className = "status-panel msg err";
+        node.textContent = "Failed to load audit trail: " + err.message;
+      }
+    }
+
+    async function refreshMaintenanceControlCenter() {
+      try {
+        const res = await fetch("/companion/cache-maintenance/operator-summary");
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "Failed to load maintenance control center");
+        }
+        renderMaintenanceControlCenter(data);
+      } catch (err) {
+        const node = document.getElementById("maintenance-control-center-panel");
+        node.className = "status-panel msg err maintenance-control-center";
+        node.textContent = "Failed to load maintenance control center: " + err.message;
+      }
+    }
+
+    async function refreshFinalReadiness() {
+      try {
+        const res = await fetch("/companion/final-readiness");
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "Failed to load final readiness");
+        }
+        renderFinalReadiness(data);
+      } catch (err) {
+        const node = document.getElementById("final-readiness-panel");
+        node.className = "status-panel msg err";
+        node.innerHTML =
+          "<strong>Final Readiness</strong>" +
+          "<div class='summary'>Failed to load final readiness: " + escapeHtml(err.message) + "</div>" +
+          "<div class='actions' style='margin-top:0.6rem;'>" +
+          "<button type='button' id='run-final-readiness-btn' class='secondary'>Run readiness check</button>" +
+          "</div>";
+        document.getElementById("run-final-readiness-btn").addEventListener("click", async function () {
+          await runFinalReadiness(this);
+        });
+      }
+    }
+
+    async function runFinalReadiness(btn) {
+      const original = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Running...";
+      try {
+        const res = await fetch("/companion/final-readiness/run", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "Final readiness run failed");
+        }
+        renderFinalReadiness(data);
+      } catch (err) {
+        const node = document.getElementById("final-readiness-panel");
+        node.className = "status-panel msg err";
+        node.innerHTML =
+          "<strong>Final Readiness</strong>" +
+          "<div class='summary'>Readiness run failed: " + escapeHtml(err.message) + "</div>" +
+          "<div class='actions' style='margin-top:0.6rem;'>" +
+          "<button type='button' id='run-final-readiness-btn' class='secondary'>Run readiness check</button>" +
+          "</div>";
+        document.getElementById("run-final-readiness-btn").addEventListener("click", async function () {
+          await runFinalReadiness(this);
+        });
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+
+    async function refreshMaintenanceSnapshots() {
+      try {
+        const res = await fetch("/companion/cache-maintenance/snapshots?limit=8");
+        const data = await res.json();
+        renderMaintenanceSnapshots(data);
+      } catch (err) {
+        const node = document.getElementById("cache-maintenance-snapshots-panel");
+        node.className = "status-panel msg err";
+        node.textContent = "Failed to load maintenance snapshots: " + err.message;
+      }
+    }
+
+    async function refreshSafetyPolicy() {
+      try {
+        const res = await fetch("/companion/cache-maintenance/policy");
+        const data = await res.json();
+        renderPolicySnapshot(data);
+      } catch (err) {
+        const node = document.getElementById("cache-maintenance-policy-panel");
+        node.className = "status-panel msg err";
+        node.textContent = "Failed to load safety policy: " + err.message;
+      }
+    }
+
     async function refreshUsage() {
       try {
         const [statusRes, eventsRes] = await Promise.all([
@@ -1060,6 +1602,8 @@ _COMPANION_HTML = """<!doctype html>
         renderUsageStatus(statusData);
         renderUsageEvents(eventsData.items || []);
         await refreshProviderDiagnostics();
+        await refreshMaintenanceControlCenter();
+        await refreshFinalReadiness();
       } catch (err) {
         const panel = document.getElementById("usage-status-panel");
         panel.className = "status-panel msg err";
@@ -2003,6 +2547,45 @@ _COMPANION_HTML = """<!doctype html>
       });
     });
 
+    document.getElementById("scan-cache-recycle-integrity-btn").addEventListener("click", async function () {
+      await runCacheRecycleAction(this, "/companion/cache-recycle-bin/integrity-scan", "Failed to scan recycle integrity", {});
+    });
+
+    document.getElementById("restore-cache-recycle-btn").addEventListener("click", async function () {
+      const key = String((document.getElementById("cache-recycle-restore-key").value || "")).trim();
+      if (!key) {
+        const node = document.getElementById("provider-diagnostics-panel");
+        node.className = "status-panel msg err";
+        node.textContent = "Enter a recycle item id or checksum before restoring.";
+        return;
+      }
+      await runCacheRecycleAction(this, "/companion/cache-recycle-bin/restore", "Failed to restore recycled cache file", {
+        recycle_item_id: key,
+        checksum_sha256: key
+      });
+    });
+
+    document.getElementById("empty-cache-recycle-btn").addEventListener("click", async function () {
+      const checkbox = document.getElementById("allow-cache-recycle-empty");
+      const confirmationText = String((document.getElementById("cache-recycle-empty-confirmation").value || "")).trim();
+      if (!checkbox.checked) {
+        const node = document.getElementById("provider-diagnostics-panel");
+        node.className = "status-panel msg err";
+        node.textContent = "Enable 'Allow empty recycle bin' before permanently clearing recycled cache files.";
+        return;
+      }
+      if (confirmationText !== "EMPTY RECYCLE BIN") {
+        const node = document.getElementById("provider-diagnostics-panel");
+        node.className = "status-panel msg err";
+        node.textContent = "Type EMPTY RECYCLE BIN exactly before emptying the recycle bin.";
+        return;
+      }
+      await runCacheRecycleAction(this, "/companion/cache-recycle-bin/empty", "Failed to empty recycle bin", {
+        allow_empty: true,
+        confirmation_text: confirmationText
+      });
+    });
+
     document.getElementById("import-best-btn").addEventListener("click", async function () {
       const result = document.getElementById("search-all-result");
       result.innerHTML = "";
@@ -2151,10 +2734,19 @@ _COMPANION_HTML = """<!doctype html>
       }
     });
 
+    document.getElementById("run-final-readiness-btn").addEventListener("click", async function () {
+      await runFinalReadiness(this);
+    });
+
     refreshInstallInfo();
     refreshHealth();
     refreshProviderStatus();
     refreshProviderDiagnostics();
+    refreshMaintenanceControlCenter();
+    refreshFinalReadiness();
+    refreshSafetyPolicy();
+    refreshAuditTrail();
+    refreshMaintenanceSnapshots();
     refreshSubsourceStatus();
     refreshUsage();
     refreshLatestBatch();
@@ -3263,7 +3855,31 @@ def provider_diagnostics() -> Dict[str, Any]:
         },
         "cache_integrity": cache_integrity.get_summary(config.DB_PATH),
         "cache_maintenance": cache_maintenance.get_summary(config.DB_PATH),
+        "cache_recycle_bin": cache_maintenance.get_recycle_bin_summary(config.DB_PATH),
+        "cache_maintenance_audit": cache_maintenance.get_audit_trail(config.DB_PATH, limit=8),
     }
+
+
+@router.get("/companion/final-readiness")
+def final_readiness_endpoint() -> Dict[str, Any]:
+    """Return the latest read-only final readiness report."""
+    return final_readiness.run_final_readiness(
+        db_path=config.DB_PATH,
+        english_cache_dir=config.ENGLISH_CACHE_DIR,
+        arabic_cache_dir=config.ARABIC_CACHE_DIR,
+        sample_srt_path=config.SAMPLE_SRT_PATH,
+    )
+
+
+@router.post("/companion/final-readiness/run")
+def final_readiness_run_endpoint() -> Dict[str, Any]:
+    """Run a read-only final readiness validation pass."""
+    return final_readiness.run_final_readiness(
+        db_path=config.DB_PATH,
+        english_cache_dir=config.ENGLISH_CACHE_DIR,
+        arabic_cache_dir=config.ARABIC_CACHE_DIR,
+        sample_srt_path=config.SAMPLE_SRT_PATH,
+    )
 
 
 @router.get("/companion/provider-quarantine")
@@ -3327,6 +3943,107 @@ def cache_maintenance_endpoint() -> Dict[str, Any]:
     return cache_maintenance.get_summary(config.DB_PATH)
 
 
+@router.get("/companion/cache-maintenance/operator-summary")
+def cache_maintenance_operator_summary_endpoint() -> Dict[str, Any]:
+    """Return a consolidated safe operator summary for maintenance workflow decisions."""
+    return cache_maintenance.get_operator_summary(
+        config.DB_PATH,
+        english_cache_dir=config.ENGLISH_CACHE_DIR,
+        arabic_cache_dir=config.ARABIC_CACHE_DIR,
+    )
+
+
+@router.get("/companion/cache-maintenance/policy")
+def cache_maintenance_policy_endpoint() -> Dict[str, Any]:
+    """Return the current cache-maintenance safety policy summary."""
+    return cache_maintenance.get_policy_snapshot(
+        config.DB_PATH,
+        english_cache_dir=config.ENGLISH_CACHE_DIR,
+        arabic_cache_dir=config.ARABIC_CACHE_DIR,
+    )
+
+
+@router.get("/companion/cache-maintenance/audit")
+def cache_maintenance_audit_endpoint(limit: int = Query(default=25, ge=1, le=100)) -> Dict[str, Any]:
+    """Return recent cache maintenance audit entries."""
+    return cache_maintenance.get_audit_trail(config.DB_PATH, limit=limit)
+
+
+@router.get("/companion/cache-maintenance/snapshots")
+def cache_maintenance_snapshots_endpoint(limit: int = Query(default=25, ge=1, le=100)) -> Dict[str, Any]:
+    """Return recent cache maintenance snapshots."""
+    return cache_maintenance.list_maintenance_snapshots(config.DB_PATH, limit=limit)
+
+
+@router.get("/companion/cache-maintenance/snapshots/{snapshot_id}")
+def cache_maintenance_snapshot_detail_endpoint(snapshot_id: str) -> Dict[str, Any]:
+    """Return one cache maintenance snapshot metadata record."""
+    try:
+        return cache_maintenance.get_maintenance_snapshot(config.DB_PATH, snapshot_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/companion/cache-maintenance/snapshots/compare")
+async def cache_maintenance_snapshots_compare_endpoint(request: Request) -> Dict[str, Any]:
+    """Compare maintenance snapshot counts and affected paths."""
+    payload = await _read_request_payload(request)
+    snapshot_id = _parse_optional_text(payload.get("snapshot_id"))
+    compare_snapshot_id = _parse_optional_text(payload.get("compare_snapshot_id"))
+    if not snapshot_id:
+        raise HTTPException(status_code=400, detail="snapshot_id is required")
+    try:
+        return cache_maintenance.compare_maintenance_snapshots(
+            config.DB_PATH,
+            snapshot_id=snapshot_id,
+            compare_snapshot_id=compare_snapshot_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/companion/cache-maintenance/rollback-plan")
+async def cache_maintenance_rollback_plan_endpoint(request: Request) -> Dict[str, Any]:
+    """Build a metadata-only rollback plan for a maintenance snapshot."""
+    payload = await _read_request_payload(request)
+    snapshot_id = _parse_optional_text(payload.get("snapshot_id"))
+    if not snapshot_id:
+        raise HTTPException(status_code=400, detail="snapshot_id is required")
+    try:
+        return cache_maintenance.build_snapshot_rollback_plan(
+            config.DB_PATH,
+            snapshot_id=snapshot_id,
+            english_cache_dir=config.ENGLISH_CACHE_DIR,
+            arabic_cache_dir=config.ARABIC_CACHE_DIR,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/companion/cache-maintenance/rollback-execute")
+async def cache_maintenance_rollback_execute_endpoint(request: Request) -> Dict[str, Any]:
+    """Execute controlled rollback for cleanup snapshots using safety gates."""
+    payload = await _read_request_payload(request)
+    snapshot_id = _parse_optional_text(payload.get("snapshot_id"))
+    dry_run = _parse_bool(payload.get("dry_run"), default=True)
+    allow_rollback = _parse_bool(payload.get("allow_rollback"), default=False)
+    confirmation_text = _parse_optional_text(payload.get("confirmation_text"))
+    if not snapshot_id:
+        raise HTTPException(status_code=400, detail="snapshot_id is required")
+    try:
+        return cache_maintenance.execute_snapshot_rollback(
+            config.DB_PATH,
+            snapshot_id=snapshot_id,
+            english_cache_dir=config.ENGLISH_CACHE_DIR,
+            arabic_cache_dir=config.ARABIC_CACHE_DIR,
+            dry_run=dry_run,
+            allow_rollback=allow_rollback,
+            confirmation_text=confirmation_text,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.post("/companion/cache-maintenance/scan")
 def cache_maintenance_scan_endpoint() -> Dict[str, Any]:
     """Scan cache directories and DB references without deleting files."""
@@ -3349,6 +4066,55 @@ async def cache_maintenance_cleanup_endpoint(request: Request) -> Dict[str, Any]
         arabic_cache_dir=config.ARABIC_CACHE_DIR,
         dry_run=dry_run,
         allow_delete=allow_delete,
+    )
+
+
+@router.get("/companion/cache-recycle-bin")
+def cache_recycle_bin_endpoint() -> Dict[str, Any]:
+    """Return active recycled cache file metadata."""
+    return cache_maintenance.get_recycle_bin_summary(config.DB_PATH)
+
+
+@router.post("/companion/cache-recycle-bin/integrity-scan")
+def cache_recycle_bin_integrity_scan_endpoint() -> Dict[str, Any]:
+    """Verify active recycled files still exist and match stored checksums."""
+    return cache_maintenance.scan_recycle_bin_integrity(
+        config.DB_PATH,
+        english_cache_dir=config.ENGLISH_CACHE_DIR,
+        arabic_cache_dir=config.ARABIC_CACHE_DIR,
+    )
+
+
+@router.post("/companion/cache-recycle-bin/restore")
+async def cache_recycle_bin_restore_endpoint(request: Request) -> Dict[str, Any]:
+    """Restore one recycled cache file back into a safe cache path."""
+    payload = await _read_request_payload(request)
+    recycle_item_id = _parse_optional_text(payload.get("recycle_item_id"))
+    checksum_sha256 = _parse_optional_text(payload.get("checksum_sha256"))
+    try:
+        return cache_maintenance.restore_recycled_file(
+            config.DB_PATH,
+            english_cache_dir=config.ENGLISH_CACHE_DIR,
+            arabic_cache_dir=config.ARABIC_CACHE_DIR,
+            recycle_item_id=recycle_item_id,
+            checksum_sha256=checksum_sha256,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/companion/cache-recycle-bin/empty")
+async def cache_recycle_bin_empty_endpoint(request: Request) -> Dict[str, Any]:
+    """Permanently clear active recycle-bin files only with explicit confirmation."""
+    payload = await _read_request_payload(request)
+    allow_empty = _parse_bool(payload.get("allow_empty"), default=False)
+    confirmation_text = _parse_optional_text(payload.get("confirmation_text"))
+    return cache_maintenance.empty_recycle_bin(
+        config.DB_PATH,
+        english_cache_dir=config.ENGLISH_CACHE_DIR,
+        arabic_cache_dir=config.ARABIC_CACHE_DIR,
+        allow_empty=allow_empty,
+        confirmation_text=confirmation_text,
     )
 
 

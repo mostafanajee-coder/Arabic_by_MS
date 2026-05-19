@@ -17,6 +17,7 @@ from .manifest import build_manifest
 from .routes_subtitles import router as subtitles_router
 from services import (
     batch_prepare_service,
+    cache_maintenance,
     cache_integrity,
     gemini_service,
     job_manager,
@@ -146,6 +147,13 @@ _COMPANION_HTML = """<!doctype html>
       <button type="button" id="clear-import-history-btn" class="secondary">Clear import history</button>
       <button type="button" id="scan-cache-integrity-btn" class="secondary">Scan cache</button>
       <button type="button" id="repair-cache-integrity-btn" class="secondary">Repair metadata</button>
+      <button type="button" id="scan-cache-maintenance-btn" class="secondary">Scan maintenance</button>
+      <button type="button" id="dry-run-cache-maintenance-btn" class="secondary">Dry-run cleanup</button>
+      <button type="button" id="cleanup-cache-maintenance-btn" class="secondary">Cleanup orphan files</button>
+      <label style="font-size:0.85rem; display:flex; align-items:center; gap:0.35rem;">
+        <input id="allow-cache-maintenance-delete" type="checkbox" />
+        Allow actual orphan cleanup
+      </label>
     </div>
     <div id="provider-diagnostics-panel" class="status-panel msg note">Loading provider diagnostics...</div>
     <div id="provider-error-log" class="empty">No recent provider issues.</div>
@@ -717,6 +725,20 @@ _COMPANION_HTML = """<!doctype html>
       renderRecentProviderErrors();
     }
 
+    function formatBytes(value) {
+      const size = Number(value || 0);
+      if (!Number.isFinite(size) || size <= 0) {
+        return "0 B";
+      }
+      if (size < 1024) {
+        return String(size) + " B";
+      }
+      if (size < 1024 * 1024) {
+        return (size / 1024).toFixed(1) + " KB";
+      }
+      return (size / (1024 * 1024)).toFixed(2) + " MB";
+    }
+
     function renderProviderDiagnostics(data) {
       window._providerDiagnostics = data || {};
       const node = document.getElementById("provider-diagnostics-panel");
@@ -732,6 +754,12 @@ _COMPANION_HTML = """<!doctype html>
       const cacheIntegrity = data.cache_integrity || {};
       const cacheIntegrityCounts = cacheIntegrity.counts || {};
       const cacheIntegrityItems = Array.isArray(cacheIntegrity.items) ? cacheIntegrity.items : [];
+      const cacheMaintenance = data.cache_maintenance || {};
+      const orphanFiles = Array.isArray(cacheMaintenance.orphan_files) ? cacheMaintenance.orphan_files : [];
+      const missingReferences = Array.isArray(cacheMaintenance.missing_references) ? cacheMaintenance.missing_references : [];
+      const staleRecords = Array.isArray(cacheMaintenance.stale_records) ? cacheMaintenance.stale_records : [];
+      const invalidIntegrityRecords = Array.isArray(cacheMaintenance.invalid_integrity_records) ? cacheMaintenance.invalid_integrity_records : [];
+      const cleanupCandidates = Array.isArray(cacheMaintenance.cleanup_candidates) ? cacheMaintenance.cleanup_candidates : [];
       const providerNames = ["gemini", "subdl", "subsource", "opensubtitles"];
       const rows = providerNames.map(name => {
         const status = providers[name] || {};
@@ -793,6 +821,25 @@ _COMPANION_HTML = """<!doctype html>
             ).join("") +
             "</tbody></table></div>"
           : "<div class='summary'>No cache integrity metadata recorded yet.</div>");
+      const cacheMaintenanceHtml = "<div class='summary'><strong>Cache Maintenance</strong>: " +
+        "total size=" + escapeHtml(formatBytes(cacheMaintenance.total_bytes || 0)) +
+        " | orphan_files=" + escapeHtml(String(orphanFiles.length)) +
+        " | missing_references=" + escapeHtml(String(missingReferences.length)) +
+        " | invalid_or_stale=" + escapeHtml(String(invalidIntegrityRecords.length + staleRecords.length)) +
+        " | last scan=" + escapeHtml(String(cacheMaintenance.scan_finished_at || "never")) +
+        "</div>" +
+        (cleanupCandidates.length
+          ? "<div class='summary'><table><thead><tr><th>Action</th><th>Path / Record</th><th>Reason</th><th>Protected</th></tr></thead><tbody>" +
+            cleanupCandidates.slice(0, 10).map(item =>
+              "<tr>" +
+              "<td>" + escapeHtml(String(item.action || "")) + "</td>" +
+              "<td>" + escapeHtml(String(item.path || item.record_id || "")) + "</td>" +
+              "<td>" + escapeHtml(String(item.reason || "")) + "</td>" +
+              "<td>" + escapeHtml(String(Boolean(item.protected))) + "</td>" +
+              "</tr>"
+            ).join("") +
+            "</tbody></table></div>"
+          : "<div class='summary'>No cache maintenance cleanup candidates recorded yet.</div>");
       node.className = "status-panel msg note";
       node.innerHTML = "<table><thead><tr><th>Provider</th><th>Status</th><th>Searches Today</th><th>Imports Today</th><th>Recent / Current Note</th></tr></thead><tbody>" +
         rows +
@@ -803,7 +850,8 @@ _COMPANION_HTML = """<!doctype html>
         " | default download timeout=" + escapeHtml(String(retrySettings.default_download_timeout_seconds || "")) + "s</div>" +
         quarantineHtml +
         importHistoryHtml +
-        cacheIntegrityHtml;
+        cacheIntegrityHtml +
+        cacheMaintenanceHtml;
       renderRecentProviderErrors();
     }
 
@@ -855,6 +903,31 @@ _COMPANION_HTML = """<!doctype html>
       btn.textContent = "Working...";
       try {
         const res = await fetch(endpoint, { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || failurePrefix);
+        }
+        await refreshProviderDiagnostics();
+      } catch (err) {
+        const node = document.getElementById("provider-diagnostics-panel");
+        node.className = "status-panel msg err";
+        node.textContent = failurePrefix + ": " + err.message;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+
+    async function runCacheMaintenanceAction(btn, endpoint, failurePrefix, payload) {
+      const original = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Working...";
+      try {
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload || {}),
+        });
         const data = await res.json();
         if (!res.ok) {
           throw new Error(data.detail || failurePrefix);
@@ -1903,6 +1976,31 @@ _COMPANION_HTML = """<!doctype html>
 
     document.getElementById("repair-cache-integrity-btn").addEventListener("click", async function () {
       await runCacheIntegrityAction(this, "/companion/cache-integrity/repair-metadata", "Failed to repair cache integrity metadata");
+    });
+
+    document.getElementById("scan-cache-maintenance-btn").addEventListener("click", async function () {
+      await runCacheMaintenanceAction(this, "/companion/cache-maintenance/scan", "Failed to scan cache maintenance", {});
+    });
+
+    document.getElementById("dry-run-cache-maintenance-btn").addEventListener("click", async function () {
+      await runCacheMaintenanceAction(this, "/companion/cache-maintenance/cleanup", "Failed to build cache cleanup plan", {
+        dry_run: true,
+        allow_delete: false
+      });
+    });
+
+    document.getElementById("cleanup-cache-maintenance-btn").addEventListener("click", async function () {
+      const checkbox = document.getElementById("allow-cache-maintenance-delete");
+      if (!checkbox.checked) {
+        const node = document.getElementById("provider-diagnostics-panel");
+        node.className = "status-panel msg err";
+        node.textContent = "Enable 'Allow actual orphan cleanup' before running real cache cleanup.";
+        return;
+      }
+      await runCacheMaintenanceAction(this, "/companion/cache-maintenance/cleanup", "Failed to cleanup orphan cache files", {
+        dry_run: false,
+        allow_delete: true
+      });
     });
 
     document.getElementById("import-best-btn").addEventListener("click", async function () {
@@ -3164,6 +3262,7 @@ def provider_diagnostics() -> Dict[str, Any]:
             "items": provider_import_history.list_entries(config.DB_PATH),
         },
         "cache_integrity": cache_integrity.get_summary(config.DB_PATH),
+        "cache_maintenance": cache_maintenance.get_summary(config.DB_PATH),
     }
 
 
@@ -3220,6 +3319,37 @@ def cache_integrity_scan_endpoint() -> Dict[str, Any]:
 def cache_integrity_repair_metadata_endpoint() -> Dict[str, Any]:
     """Refresh safe cache integrity metadata without deleting any records."""
     return cache_integrity.scan_records(config.DB_PATH, repair_metadata=True)
+
+
+@router.get("/companion/cache-maintenance")
+def cache_maintenance_endpoint() -> Dict[str, Any]:
+    """Return the latest safe cache maintenance summary."""
+    return cache_maintenance.get_summary(config.DB_PATH)
+
+
+@router.post("/companion/cache-maintenance/scan")
+def cache_maintenance_scan_endpoint() -> Dict[str, Any]:
+    """Scan cache directories and DB references without deleting files."""
+    return cache_maintenance.scan_cache(
+        config.DB_PATH,
+        english_cache_dir=config.ENGLISH_CACHE_DIR,
+        arabic_cache_dir=config.ARABIC_CACHE_DIR,
+    )
+
+
+@router.post("/companion/cache-maintenance/cleanup")
+async def cache_maintenance_cleanup_endpoint(request: Request) -> Dict[str, Any]:
+    """Build a safe cleanup plan and optionally delete orphan files."""
+    payload = await _read_request_payload(request)
+    dry_run = _parse_bool(payload.get("dry_run"), default=True)
+    allow_delete = _parse_bool(payload.get("allow_delete"), default=False)
+    return cache_maintenance.cleanup_cache(
+        config.DB_PATH,
+        english_cache_dir=config.ENGLISH_CACHE_DIR,
+        arabic_cache_dir=config.ARABIC_CACHE_DIR,
+        dry_run=dry_run,
+        allow_delete=allow_delete,
+    )
 
 
 @router.get("/companion/install-info")

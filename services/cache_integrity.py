@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from services import cache_db, provider_import_history
+from utils.srt_quality import analyze_srt_quality
 from utils.srt_validator import SRTValidationError, validate_srt_content
 
 PathLike = Union[str, Path]
@@ -130,6 +131,7 @@ def verify_record(
     quality_acceptable = normalized_quality_level in {"good", "warning"}
     warnings: List[str] = []
     status = STATUS_VALID
+    actual_quality: Dict[str, Any] = {}
 
     record = cache_db.get_record(db_path, int(record_id or 0))
     if not record:
@@ -153,19 +155,48 @@ def verify_record(
                     warnings.append("Cached English subtitle file is unreadable.")
                 else:
                     try:
-                        validate_srt_content(raw)
+                        text = validate_srt_content(raw)
                     except SRTValidationError as exc:
                         status = STATUS_INVALID_SRT
                         warnings.append(str(exc))
+                    else:
+                        actual_quality = analyze_srt_quality(text, expected_language="en")
+                        actual_warnings = [
+                            str(item)
+                            for item in (actual_quality.get("quality_warnings") or [])
+                            if str(item).strip()
+                        ]
+                        actual_reject_hint = bool(actual_quality.get("reject_hint"))
+                        actual_quality_level = _normalize_text(actual_quality.get("quality_level"))
+                        if actual_reject_hint and _is_structural_quality_failure(actual_warnings):
+                            status = STATUS_INVALID_SRT
+                            if actual_warnings:
+                                warnings.append(actual_warnings[0])
+                            quality_acceptable = False
+                        else:
+                            if normalized_quality_level in {"good", "warning"} and actual_quality_level == "bad":
+                                quality_acceptable = False
+                                warnings.append(
+                                    "Cached subtitle content quality no longer matches stored quality metadata."
+                                )
+                            else:
+                                quality_acceptable = (
+                                    normalized_quality_level in {"good", "warning"}
+                                    and actual_quality_level != "bad"
+                                    and not actual_reject_hint
+                                )
+                            if actual_warnings and actual_quality_level == "warning":
+                                warnings.append(actual_warnings[0])
 
     if status == STATUS_VALID:
         if normalized_quality_level is None:
             status = STATUS_STALE_RECORD
             warnings.append("Cached subtitle quality metadata is missing.")
         elif not quality_acceptable:
-            warnings.append(
-                "Cached subtitle quality metadata is not eligible for immediate local-first reuse."
-            )
+            if not warnings:
+                warnings.append(
+                    "Cached subtitle quality metadata is not eligible for immediate local-first reuse."
+                )
 
     payload = {
         "record_id": int(record_id or 0) or None,
@@ -349,6 +380,18 @@ def _decode_warnings(value: Any) -> List[str]:
     if not isinstance(parsed, list):
         return []
     return [str(item) for item in parsed if str(item).strip()]
+
+
+def _is_structural_quality_failure(warnings: List[str]) -> bool:
+    structural_markers = (
+        "malformed timestamp",
+        "cue numbering looks invalid",
+        "overlapping cues",
+        "empty cue",
+        "subtitle content is empty",
+    )
+    lowered = [str(item).strip().lower() for item in warnings if str(item).strip()]
+    return any(marker in warning for warning in lowered for marker in structural_markers)
 
 
 def _normalize_text(value: Any) -> Optional[str]:

@@ -29,6 +29,7 @@ GOOD_SRT = (
 )
 
 INVALID_SRT = "not actually an srt file"
+MALFORMED_TIMESTAMP_SRT = "1\nBAD --> TIMESTAMP\nText\n"
 
 
 @pytest.fixture
@@ -247,6 +248,101 @@ def test_invalid_cached_srt_is_not_reused(client: TestClient, monkeypatch) -> No
     assert second["cache_integrity"]["integrity_status"] == cache_integrity.STATUS_INVALID_SRT
 
 
+def test_verify_record_rejects_malformed_timestamp_cached_file(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    seeded = _run_import_best(
+        client,
+        monkeypatch,
+        video_id="tt25000031",
+        items=[
+            _candidate(
+                provider="subdl",
+                subtitle_id="direct-malformed",
+                download_url="https://subdl.local/direct-malformed.srt",
+                score=95.0,
+                release_name="Movie.Direct.Malformed",
+            )
+        ],
+        payload_by_url={"https://subdl.local/direct-malformed.srt": GOOD_SRT.encode("utf-8")},
+    )
+    record = _cached_record(int(seeded["record_id"]))
+    Path(str(record["english_srt_path"])).write_text(MALFORMED_TIMESTAMP_SRT, encoding="utf-8")
+
+    integrity = cache_integrity.verify_record(
+        config.DB_PATH,
+        record_id=int(seeded["record_id"]),
+        provider="subdl",
+        release_name="Movie.Direct.Malformed",
+        video_identity="tt25000031",
+        quality_level="good",
+        quality_score=100,
+    )
+
+    assert integrity["integrity_status"] == cache_integrity.STATUS_INVALID_SRT
+    assert integrity["quality_acceptable"] is False
+    assert integrity["integrity_warnings"]
+    assert "timestamp" in integrity["integrity_warnings"][0].lower()
+
+
+def test_malformed_timestamp_cached_srt_is_not_reused_before_provider_search(
+    client: TestClient,
+    monkeypatch,
+) -> None:
+    first = _run_import_best(
+        client,
+        monkeypatch,
+        video_id="tt25000032",
+        items=[
+            _candidate(
+                provider="subdl",
+                subtitle_id="malformed-local",
+                download_url="https://subdl.local/malformed-local.srt",
+                score=96.0,
+                release_name="Movie.Malformed.Local",
+            )
+        ],
+        payload_by_url={"https://subdl.local/malformed-local.srt": GOOD_SRT.encode("utf-8")},
+    )
+    record = _cached_record(int(first["record_id"]))
+    Path(str(record["english_srt_path"])).write_text(MALFORMED_TIMESTAMP_SRT, encoding="utf-8")
+
+    calls = {"search": 0}
+
+    def fake_search(**kwargs):
+        calls["search"] += 1
+        return {
+            "items": [
+                _candidate(
+                    provider="subdl",
+                    subtitle_id="malformed-local",
+                    download_url="https://subdl.local/malformed-local.srt",
+                    score=96.0,
+                    release_name="Movie.Malformed.Local",
+                )
+            ],
+            "provider_errors": {},
+            "searched_providers": ["subdl"],
+        }
+
+    monkeypatch.setattr(provider_router, "search_all_subtitles", fake_search)
+    monkeypatch.setattr(
+        provider_router,
+        "download_subtitle_data",
+        lambda provider, url: GOOD_SRT.encode("utf-8"),
+    )
+
+    second = client.post("/companion/import-best", json={"video_id": "tt25000032"})
+    assert second.status_code == 200, second.text
+    payload = second.json()
+
+    assert calls["search"] == 1
+    assert payload["record_id"] != first["record_id"]
+    assert payload["local_first_reused"] is False
+    assert payload["cache_integrity"]["integrity_status"] != cache_integrity.STATUS_VALID or payload["cache_integrity"]["quality_acceptable"] is False
+
+
 def test_exact_candidate_reuse_verifies_integrity_before_reusing(client: TestClient, monkeypatch) -> None:
     first = _run_import_best(
         client,
@@ -367,3 +463,45 @@ def test_batch_prepare_handles_stale_local_record_safely(client: TestClient, mon
     assert item["status"] == "failed"
     assert item["cache_integrity"]["integrity_status"] == cache_integrity.STATUS_MISSING_FILE
     assert "could not be reused safely" in str(item["error_message"] or "").lower()
+
+
+def test_batch_prepare_does_not_reuse_malformed_cached_srt(client: TestClient, monkeypatch) -> None:
+    seeded = _run_import_best(
+        client,
+        monkeypatch,
+        video_id="tt2500007:1:1",
+        items=[
+            _candidate(
+                provider="subdl",
+                subtitle_id="batch-malformed",
+                download_url="https://subdl.local/batch-malformed.srt",
+                score=95.0,
+                release_name="Show.S01E01.Batch.Malformed",
+            )
+        ],
+        payload_by_url={"https://subdl.local/batch-malformed.srt": GOOD_SRT.encode("utf-8")},
+    )
+    record = _cached_record(int(seeded["record_id"]))
+    Path(str(record["english_srt_path"])).write_text(MALFORMED_TIMESTAMP_SRT, encoding="utf-8")
+
+    monkeypatch.setattr(provider_router, "get_provider_status", _disabled_provider_status)
+    monkeypatch.setattr(
+        provider_router,
+        "search_all_subtitles",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("provider search should not run when providers are unavailable")
+        ),
+    )
+
+    response = client.post(
+        "/companion/batch-prepare",
+        json={"imdb_id": "tt2500007", "season": 1, "episode_start": 1, "episode_end": 1},
+    )
+    assert response.status_code == 200, response.text
+    final = _wait_for_batch(client, response.json()["batch_id"])
+    item = final["items"][0]
+
+    assert final["status"] == "failed"
+    assert item["status"] == "failed"
+    assert item["cache_integrity"]["integrity_status"] == cache_integrity.STATUS_INVALID_SRT
+    assert item["local_first_reused"] is False
